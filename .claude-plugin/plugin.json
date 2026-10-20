@@ -1,0 +1,41 @@
+{
+  "name": "harness-architect",
+  "version": "1.0.6",
+  "description": "Meta-tool that analyzes a project and builds a complete Claude Code harness (CLAUDE.md, settings, rules, agents, playbooks, hooks, MCP) through a 9-phase orchestrated workflow with Agent-Playbook separation and a red-team advisor.",
+  "author": {
+    "name": "leee880619-commits",
+    "url": "https://github.com/leee880619-commits"
+  },
+  "homepage": "https://github.com/leee880619-commits/ClaudeCode-Harness-Setup-Assistant",
+  "repository": "https://github.com/leee880619-commits/ClaudeCode-Harness-Setup-Assistant",
+  "license": "Apache-2.0",
+  "keywords": [
+    "harness",
+    "orchestrator",
+    "agent-team",
+    "scaffolding",
+    "meta-tool",
+    "setup-assistant"
+  ],
+  "agents": [
+    "./.claude/agents/phase-setup.md",
+    "./.claude/agents/phase-domain-research.md",
+    "./.claude/agents/phase-design.md",
+    "./.claude/agents/phase-team.md",
+    "./.claude/agents/phase-skills.md",
+    "./.claude/agents/phase-hooks.md",
+    "./.claude/agents/phase-validate.md",
+    "./.claude/agents/red-team-advisor.md",
+    "./.claude/agents/phase-setup-lite.md",
+    "./.claude/agents/ops-auditor.md",
+    "./.claude/agents/security-auditor.md",
+    "./.claude/agents/fit-auditor.md",
+    "./.claude/agents/harness-auditor.md"
+  ],
+  "commands": [
+    "./commands/harness-setup.md",
+    "./commands/audit.md",
+    "./commands/help.md"
+  ],
+  "hooks": "./.claude/hooks/hooks.json"
+}

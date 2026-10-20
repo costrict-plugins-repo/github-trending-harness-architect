@@ -1,0 +1,35 @@
+# Personal overrides (not shared)
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/memory/
+
+# Internal development notes (not shared)
+dev-notes/
+improvements/
+
+# docs/ — only index.html is tracked; everything else is local-only
+docs/*
+!docs/index.html
+*.log
+
+# Language / tooling caches that may appear in contrib workflows
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Archive directory created during the initial public-release prep
+# (out-of-tree, but also ignore any local copy that might land inside the repo)
+_harness-archive/

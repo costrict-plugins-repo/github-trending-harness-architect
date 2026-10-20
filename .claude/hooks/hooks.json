@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "timeout": 10,
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/syntax-check.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

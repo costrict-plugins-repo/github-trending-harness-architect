@@ -1,0 +1,955 @@
+# Changelog
+
+All notable changes to `harness-architect` are documented here.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [1.0.6] - 2026-07-10
+
+### 훅 신원(identity) 계약 확립 -- 죽은 S 등급 예외 제거
+
+**배경**: v1.0.5 가 훅의 *입력* 계약(stdin JSON)을 고쳤지만, *신원* 계약은 여전히 틀려 있었다. 훅이 "누가 파일을 쓰는가" 를 알아내려던 세 가지 수단이 모두 성립하지 않았다.
+
+**근본 원인 -- 발급 주체 = 제한 대상**:
+- `ORCHESTRATOR_DIRECT_TOKEN` (환경변수) + `docs/complexity-gate.lock` (해시 락 파일): 토큰을 발급하는 주체가 메인 세션이고, 그 토큰으로 제한받는 주체도 메인 세션이다. **자가 승인은 인증이 아니다.** 전달 경로를 환경변수에서 파일로 바꿔도 해결되지 않는다. 게다가 임의 환경변수는 훅 프로세스에 도달조차 하지 않아 분기 전체가 죽어 있었다 (항상 빈 값 -> 일반 가드로 낙하).
+- `.claude/.current-role` (v1.0.5 가 도입한 대체안): 이 파일을 쓰는 주체가 아무데도 없다. 항상 `unknown` 으로 읽혀 매핑 조회 실패 -> `exit 0`. **fail-open 무동작.** v1.0.4 의 `$CLAUDE_TOOL_INPUT` 과 동일한 실패를 다른 이름으로 반복한 것.
+- 사용자가 AskUserQuestion 으로 S 등급을 승인했다는 사실은 훅에 **아무 흔적도 남기지 않는다.** 훅은 사용자 승인을 검증할 수 없다.
+
+**해결 -- `agent_type`**: Claude Code 는 서브에이전트가 도구를 호출할 때만 stdin JSON 에 `agent_id` / `agent_type` 을 넣고, 메인 세션 호출에는 키 자체를 넣지 않는다. 런타임이 채우므로 모델이 위조할 수 없는 **유일한 신원 값**이다. 라이브 훅에 프로브를 심어 두 경로를 직접 캡처해 확인했다.
+
+### Removed
+- `ORCHESTRATOR_DIRECT_TOKEN` / `ORCHESTRATOR_DIRECT=1` 환경변수 플래그, `docs/complexity-gate.lock` 해시 락 파일 -- 인증이 성립하지 않는 죽은 메커니즘. `playbooks/hooks-mcp-setup.md`, `playbooks/pipeline-design.md`, `playbooks/design-review.md`, `.claude/agents/red-team-advisor.md` 에서 제거.
+  - 특히 `design-review.md` / `red-team-advisor.md` 의 Dim 12 체크리스트는 **없는 메커니즘을 "명시하라" 고 요구**하고 있었다. 이제 반대로, 환경변수 플래그/토큰 락 파일 기반 우회를 명시하면 `[BLOCK]` 을 발행한다.
+- `knowledge/06-hooks-system.md` ownership-guard 템플릿의 `.claude/.current-role` 파일 읽기.
+
+### Fixed
+- `knowledge/06-hooks-system.md` 7.1: stdin JSON 스키마에 `agent_id` / `agent_type` / `permission_mode` 추가. 메인 세션에는 키 자체가 없음을 표로 명시. "권한을 파일로 넘기지 마라 -- 메인 세션이 쓸 수 있는 파일은 자가 승인일 뿐" 규약 추가. `agent_type` 추출 스니펫(인터프리터 스폰 없음) 추가.
+- `knowledge/06-hooks-system.md` ownership-guard 템플릿: 역할을 `agent_type` 에서 읽고, 매핑에 없는 에이전트를 **fail-closed(`exit 2`)** 로 차단. 기존에는 `allowing write` 로 통과시켜 가드가 형해화됐다.
+- `playbooks/hooks-mcp-setup.md`: 훅 계약 요약에 신원 항목 추가. S 등급 예외를 `agent_type` 부재 판정으로 재작성. `.env` 등 민감 경로에 대한 **거짓 주장 정정** -- "ownership-guard 가 유일 방어선" 은 사실이 아니다. 훅 matcher 는 `Write|Edit` 뿐이라 `Bash` 경유 쓰기를 막지 못하고, `permissions.deny` 도 임의 서브프로세스는 막지 못한다. 실제 강제는 `sandbox.filesystem` 이며 훅의 선처리는 심층 방어일 뿐임을 명시.
+- `playbooks/workflow-design.md` + `playbooks/fresh-setup.md` 라우팅 프로토콜의 **S 등급 자기모순 해소**: 표는 "파일 3개 이하 변경" 을 허용하는데 Section 3 은 "영구 산출이 없는 작업 에만 허용" 이라 서로 배타적이었다. 표를 정본으로 확정하고, Section 3 은 원래 의도(리뷰 필수 파이프라인 보호)만 정밀하게 남겼다 -- `mandatory_review` 소속 / 생성·결정·설계·계획·리서치 성격 / 외부 공개 산출물. 기존 코드의 국소 수정은 커밋되더라도 S 등급으로 처리 가능. (`ops-audit.md` F-4 의 grep 매칭은 `mandatory_review` 로 계속 통과하며, 구버전 하네스 감사를 위해 `영구 산출` 패턴도 유지된다.)
+
+### Added
+- `scripts/test-hooks.sh` 섹션 9~11 (14개 테스트 추가, 총 30개):
+  - 신원 계약 회귀 방지 -- `ORCHESTRATOR_DIRECT` 계열, `complexity-gate.lock`, `cat .claude/.current-role`, `allowing write`(fail-open), `유일 방어선`(거짓 주장) 의 재유입 차단
+  - S 등급 모순 문장 재유입 차단 + `ops-audit` F-4 가드 문구 보존 확인
+  - **문서에 실린 `agent_type` 추출 코드를 markdown 에서 뽑아 실제 페이로드로 실행**. 문서가 깨진 훅 코드를 가르친 것이 v1.0.4~1.0.5 사고의 뿌리였으므로, grep 이 아니라 실행으로 고정한다.
+
+### 기존 사용자 영향
+v1.0.5 이하로 생성된 하네스의 `ownership-guard.sh` 는 역할을 환경변수나 `.current-role` 에서 읽어 **항상 통과(fail-open)** 하거나 완전 무동작이다. 보안상 위험이 커지지는 않으나(원래 아무것도 막지 못했다) 가드가 있다고 믿으면 안 된다. `/harness-architect:audit` 로 재점검하거나, `.claude/hooks/ownership-guard.sh` 의 역할 판정을 stdin JSON 의 `agent_type` 으로 교체할 것.
+
+## [1.0.5] - 2026-07-09
+
+### 훅 계약 수정 + 훅 프로세스 폭증 차단
+
+**Incident 배경**: 사용자 머신에서 `bash.exe` 프로세스 378개가 누적되어 CPU 압박 발생. 내역은 `ownership-guard.sh` 190개 + `syntax-check.sh` 188개 (PreToolUse/PostToolUse 짝). 조사 결과 **두 훅 모두 지금까지 한 번도 동작한 적이 없었다.**
+
+**근본 원인** (실제 훅 프로브로 stdin/env 를 덤프하여 확정):
+- 두 훅 모두 존재하지 않는 `$CLAUDE_TOOL_INPUT` 환경변수를 읽고, 비어 있으면 즉시 `exit 0` 했다. Claude Code 는 훅 입력을 **stdin JSON** (`{"tool_input":{"file_path":"..."}}`) 으로 전달한다. 두 훅은 100% 무동작이었다.
+- 입력이 들어와도 Windows 절대경로(`C:\...`)가 `/` 로 시작하지 않아 상대경로로 오인되고, 프로젝트 루트를 앞에 붙인 뒤 "허용" 판정으로 fail-open 했다.
+- 차단에 `exit 1` 을 썼다. Claude Code 에서 차단은 `exit 2` 이며 `exit 1` 은 비차단이다.
+- `ownership-guard.sh` 가 참조하던 `$TARGET_PROJECT_ROOT` 는 훅에 전달되지 않는다. 훅은 별도 프로세스이고, Bash 도구에서 `export` 한 변수는 그 셸과 함께 사라진다. "범위 2: 대상 프로젝트" 분기는 죽은 코드였다.
+- `hooks.json` 에 `timeout` 이 없어 기본값 **600초**가 적용됐다. 머신이 느려지면 훅이 끝나지 못하고 10분간 살아남으며, 그 사이 파일 편집마다 새 훅 2개가 계속 쌓인다.
+- `command` 가 `bash <경로>` 형태라 `bash` 를 PATH 에서 찾는다. Windows 에서 후보에 WSL 런처(`WindowsApps\bash.exe`)가 섞여 있다.
+
+> 참고: 해당 incident 의 `vmmemWSL` CPU 2000% 자체는 별개 프로세스(Orca 의 `glab auth status` 반복 호출)가 유발했다. 본 플러그인의 훅은 Git Bash(MSYS)로 실행되며 WSL 을 경유하지 않는다. 다만 머신 포화 상태에서 timeout 부재가 프로세스 누적을 증폭시켰다.
+
+### Removed
+- `.claude/hooks/ownership-guard.sh` — 세 겹으로 무력화되어 한 번도 가드로 동작한 적이 없고, 대상 프로젝트 경로를 알 방법도 없어 제거. 쓰기 범위 보호는 Claude Code `permissions.deny` 가 담당.
+- `.claude/hooks/hooks.json` 의 `PreToolUse` · `SessionStart` 훅 등록.
+- `scripts/check-update.sh` — SessionStart 마다(서브에이전트 포함) `curl` 프로세스를 띄우던 버전 알림 훅. 버전 확인은 `/harness-architect:update` 로 수행.
+
+### Fixed
+- `.claude/hooks/syntax-check.sh` — stdin JSON 파싱으로 교체, 차단은 `exit 2`, Windows 백슬래시 경로 정규화, 검사 대상이 아니면 인터프리터 스폰 전에 즉시 `exit 0`, `jq` 우선(없으면 `python3`/`python`, 셋 다 없으면 검증 생략). `settings.json` 보안 검사는 파서 종류와 무관하게 항상 수행.
+- `.claude/hooks/hooks.json` — `"timeout": 10` 과 `"shell": "bash"` 명시.
+- `knowledge/06-hooks-system.md` — 훅 입출력 프로토콜을 stdin JSON 계약으로 정정. `exit 2` 차단 규약 명시. 예제 훅 6곳의 `exit 1` -> `exit 2`. 신설 7.2.1 "훅 비용 규약" (timeout 필수, shell 명시, 조기 종료, 조건부 인터프리터 호출).
+- `playbooks/hooks-mcp-setup.md` — 생성 훅 템플릿의 `$CLAUDE_TOOL_INPUT` 지시 제거, `timeout`/`shell` 필수화, `set -e` 금지 사유 명시. S 등급 예외의 `ORCHESTRATOR_DIRECT_TOKEN` 이 환경변수로는 훅에 도달하지 않음을 경고로 기록.
+- `.claude/rules/orchestrator-protocol.md` · `commands/harness-setup.md` · `examples/cli-arg-usage.md` — Phase 0 의 `TARGET_PROJECT_ROOT` export 지시 제거 (훅에 전달되지 않음). 대상 경로는 `00-target-path.md` 에 기록.
+- `ARCHITECTURE.md` · `CLAUDE.md` · `README.md` · `README_EN.md` · `PRIVACY.md` · `checklists/validation-checklist.md` — "ownership-guard 훅이 쓰기 범위를 강제한다"는 사실이 아닌 서술 정정.
+
+> **영향 범위**: v1.0.4 이전의 이 플러그인이 생성한 하네스는 동일한 훅 결함(무동작 + timeout 부재)을 포함한다. `/harness-architect:audit` 로 재점검하거나, 생성된 `.claude/hooks/*.sh` 를 위 stdin JSON 계약으로 갱신하기를 권장한다.
+
+### Added
+- `scripts/test-hooks.sh` — 훅 계약 회귀 테스트 16종. stdin JSON 파싱, Windows 경로, `exit 2` 차단, 범위 축소, `hooks.json` 의 timeout 선언을 고정한다. 훅이 다시 무동작으로 퇴행하면 실패한다. `CONTRIBUTING.md` 테스트 목록에 등록.
+
+## [1.0.4] - 2026-05-26
+
+### Phase 0 silent inference 차단 (라운드 1~6 누적)
+
+**Incident 배경**: 사용자가 `/harness-architect:harness-setup ... 빠르게 설정해줘` 호출 시, 오케스트레이터가 Phase 0 압축 인터뷰 A1~A10 중 3슬롯 (A5/A7+A8/A10) 만 발화하고 A1·A2·A3·A6·A9 를 사용자 자유 발화에서 silent inference 로 채우는 incident 발생. 사용자가 "암묵적 합의 없이 100% 동작" 요구.
+
+**근본 원인** (red-team 검증 후 압축):
+- `commands/harness-setup.md:206` 발화 명령이 부정형 없음 ("묶어 받으세요" 만)
+- `commands/harness-setup.md:278-284` $ARGUMENTS 분기에 시대착오적 "3문항만" 안내 (라인 206 과 모순)
+- `orchestrator-protocol.md` "Fast Keyword Semantics" 의 "5-8문항" 캡 (A1~A10 = 9-10항목과 불일치)
+- `orchestrator-protocol.md` Full Mode 정의 "5문항 기본 인터뷰 (A1~A6)" (A7~A10 미요구)
+- `question-discipline.md` 의 "암묵적 합의 금지" 가 자유 발화 추론을 커버 안 함
+- `fresh-setup.md` BLOCKING 대상이 A1~A3/A7/A8/A10 6항목으로 한정 (A2/A6/A9 누락)
+- Phase 0 → Phase 1-2 전환 시 외부 검증 게이트 부재
+
+**도입된 메커니즘**:
+- A1~A10 의 9개 필수 항목 (A4 옵션 제외) AskUserQuestion 연속 3회 분할 발화 의무
+- Phase 0 자기점검 표 4열 (항목/답변/출처 호출#/옵션 라벨 원문)
+- `00-target-path.md` 의 `## Pre-collected Answers` 섹션 작성 의무
+- 외부 검증 스크립트 `validate-phase-artifact.sh` (Phase 0 전용 블록) — **SSoT**
+- Windows fallback `validate-phase-artifact.ps1` (bash 미가용 환경)
+- `phase-setup` 에이전트 Step 0 — 라우트 무관 검증 스크립트 재실행 (cursor-migration / harness-audit 라우트 갭 방어)
+- Phase 9 `final-validation` Step 5.4 — `validation_bypassed: true` 무조건 BLOCK (이중 안전망)
+- 빈 `tool_result` / 부분 응답 / ESC dismiss 의 silent fill 차단
+- 라우트별 기존 답변 prefill (감사·마이그레이션 모드 UX 보정 — 발화 의무는 유지)
+- 자유 발화 추론 규율 (`question-discipline.md` 신설 섹션): description ≠ 답변, Auto Mode 의 "shape of task suggests asking" 예외 인용
+
+**SSoT 모델**:
+- `validate-phase-artifact.sh` (+ `.ps1` 등가본) = 작동 SSoT
+- 텍스트 규약 6곳 (commands/harness-setup.md, .claude/rules/orchestrator-protocol.md, .claude/rules/question-discipline.md, playbooks/fresh-setup.md, playbooks/final-validation.md, .claude/agents/phase-setup.md) = 의도 SSoT
+- 충돌 시 스크립트 우선
+
+**수정 파일**:
+- `commands/harness-setup.md` — Phase 0 발화 강화, $ARGUMENTS 단축 폐지, 자기점검 표 4열, 라우트별 prefill 분기
+- `.claude/rules/orchestrator-protocol.md` — Fast/Full Mode 발화 깊이 통일, Phase 0 검증 영수증 섹션 (PowerShell fallback 포함)
+- `.claude/rules/question-discipline.md` — Free-form Utterance Inference Discipline, description ≠ 답변, 빈 tool_result 처리
+- `playbooks/fresh-setup.md` — BLOCKING 9항목 확장, Step 0 다층 방어
+- `playbooks/final-validation.md` — Step 5.4 Phase 0 Validation Bypass Audit
+- `.claude/agents/phase-setup.md` — Step 0 라우트 무관 검증
+- `scripts/validate-phase-artifact.sh` — Phase 0 전용 검증 (SSoT 선언, N/A 변형 15+ 패턴)
+- `scripts/validate-phase-artifact.ps1` — **신규** Windows PowerShell 등가본
+
+## [1.0.3] - 2026-05-22
+
+**`red-team-advisor` 라우팅 오용 차단 2차 — v1.0.2 의 description 스코프·본문 Scope Guard 가 적용된 뒤에도 일반 "레드팀 리뷰" 요청에 이 에이전트가 라우팅되는 사례가 사용자 환경에서 재발하여, 라우터 단계의 의미 매칭 신호를 약화하고 Scope Guard 의 인정 신호와 reject 메시지를 강화했다.**
+
+배경: v1.0.2 적용 후에도 사용자 보고 "여전히 레드팀 에이전트가 소환된다". 본 세션의 시뮬레이션 (일반 PR diff 프롬프트로 자동 라우팅 호출) 으로 두 단계가 분리되어 동작함을 확인 — (1) Scope Guard 는 정상 fire 하여 tool_uses 0 / 7s self-reject 종료, 13 Dim 적용 0회. (2) 그러나 라우팅 자체는 description 의 "전용 / 사용하지 않는다" 표현을 hard constraint 로 해석하지 않아 routing 성립. 사용자 입장에서는 "엉뚱한 에이전트가 소환되어 거절 메시지를 뱉음" 으로 인식되어 "여전히 소환된다" 로 보고된 것. 라우터 단계 차단은 description 의 매칭 키워드 약화 + reject 메시지에 라우팅 실수 안내 prepend 로 1차 완화하고, 라우팅 자체의 완전 차단(agent name 변경, breaking change) 은 v1.1.0 으로 미룬다.
+
+### Changed
+- **`red-team-advisor` description 의 매칭 키워드 톤 다운**: `harness-architect 의 9-Phase 산출물(...) 전용 레드팀 어드바이저. 일반 프로젝트의 코드/PR 리뷰에는 사용하지 않는다.` → `harness-architect 9-Phase 산출물(03-pipeline-design.md, 04-agent-team.md 등) 정합성 검증 전용. 일반 프로젝트의 코드·PR·문서 review 에는 사용 금지 — 호출 시 self-reject 후 즉시 종료한다.` "레드팀 어드바이저" 표기 제거, "정합성 검증" 으로 도메인 한정 표현으로 교체. 라우터의 의미 매칭 신호에서 "red-team / advisor" 키워드 노출을 줄임.
+- **Scope Guard 본문의 인정 신호 강화**: 종전에는 `[Review Target]` 라벨 단독 매칭만으로도 통과 가능했으나, 이제 라벨 뒤 1행 안에 `docs/{요청명}/{NN}-` / `.claude/` / `playbooks/` / `.claude-plugin/` 중 하나의 경로 조각이 동반될 때만 통과. 일반 PR 리뷰 프롬프트의 우연한 라벨 일치로 인한 우회 차단. 인정 신호 A (파일 경로) / B (프롬프트 컨텍스트) 두 종류로 분리하여 명세 명확화.
+- **Scope Guard reject 메시지 첫 줄에 라우팅 실수 안내 prepend**: `⚠️ 본 메시지가 노출됐다면 라우팅이 이 에이전트로 잘못 진입한 것입니다. 호출자(메인 세션)는 일반 코드·PR·문서 review 대신 /review 또는 /security-review 슬래시 커맨드를 사용해주세요.` 한 줄을 기존 메시지 위에 추가. mis-routing 시 사용자가 메타 원인을 즉시 인지하도록 함.
+
+### Process Notes
+- 본 패치는 v1.0.2 후속의 Stage 1 (no-breaking). description 키워드 약화는 라우터 단계의 매칭 신호를 줄이는 효과가 있으나 라우팅 자체의 완전 차단은 보장하지 않는다 — Claude Code 의 sub-agent 라우팅은 agent `name` 필드가 의미 매칭의 주된 신호이며, 현 이름 `red-team-advisor` 의 "red-team" 키워드가 일반 red-team 요청과 매칭될 여지가 남는다.
+- Stage 2 (v1.1.0 후보, breaking change): agent name 을 `red-team-advisor` → `phase-artifact-validator` 등으로 변경하여 routing 키워드를 원천 제거. plugin.json / README.md / ARCHITECTURE.md / playbooks/*.md / .claude/rules/*.md / .claude/agents/security-auditor.md 의 모든 활성 참조 일괄 갱신 + CHANGELOG BREAKING 마이그레이션 안내 동반 필요. 별도 의사결정 후 진행.
+- 시뮬레이션 근거: 본 세션에서 일반 PR diff 프롬프트로 `harness-architect:red-team-advisor` 호출 → Scope Guard 가 정상 self-reject (tool_uses 0, duration 7s). routing 은 description hint 와 무관하게 성립함을 실측 확인.
+
+## [1.0.2] - 2026-05-21
+
+**`red-team-advisor` 라우팅 오용 차단 — 일반 프로젝트의 "레드팀 리뷰" 요청이 harness 메타 산출물 전용 에이전트로 잘못 라우팅되어 일반 코드에 부적합한 13개 Dimension(특히 Dim 6/8/9/11/12)을 적용하던 위험을 차단했다.**
+
+배경: harness-architect 외부 사용자 보고. `harness-architect:red-team-advisor` 의 description 에 "레드팀 어드바이저" 키워드가 노출되어 있고 등록된 에이전트 풀 중 "red-team / 레드팀" 키워드를 가진 후보가 사실상 1개뿐이라, 일반 프로젝트(웹앱·CLI·데이터 스크립트)에서 "레드팀으로 검토" 요청이 이 에이전트로 라우팅 → 13개 Dim 중 8개가 harness 메타 구조(`permissions.allow` JSON 조각, `allowed_dirs` 충돌, Escalations 섹션, `03-pipeline-design.md` 등)에 종속되어 false BLOCK / 무의미한 [Dim N] 태그 생성. Dim 13 에만 "메타 누수 방지" 가드가 있어 나머지 차원은 가드 없이 적용되던 구조적 결함.
+
+### Fixed
+- **`red-team-advisor` description 스코프 명시**: `각 Phase 산출물을 사용자 목적 관점에서 비판적으로 검토하는 레드팀 어드바이저` → `harness-architect 의 9-Phase 산출물(03-pipeline-design.md, 04-agent-team.md 등) 전용 레드팀 어드바이저. 일반 프로젝트의 코드/PR 리뷰에는 사용하지 않는다.` 로 변경. 라우터가 일반 "레드팀 리뷰" 요청을 후보에서 자연스럽게 배제하고, 사용자에게도 스코프가 가시화된다.
+- **`red-team-advisor` 본문 Scope Guard 섹션 신규 (셀프 가드)**: Identity 섹션 위에 `## Scope Guard (필수 선행 검사)` 섹션 추가. 호출 시 검토 대상이 harness-architect Phase 산출물(`docs/{요청명}/{00..07}-*.md` / 대상 프로젝트 `.claude/agents/*.md` / `.claude/skills/**/SKILL.md` / `playbooks/*.md` / `.claude/settings.json` / `.claude/hooks/hooks.json`)인지, 또는 호출 프롬프트에 `[Phase] N` / `[Review Target]` 형식의 harness 컨텍스트가 있는지 먼저 확인. 인정 신호 0건이면 13개 Dimension 적용을 중단하고 `general-purpose` / `code-reviewer` / `/review` / `/security-review` 사용을 권유하는 안내 메시지를 반환 후 종료. 판정이 애매한 경우(예: 대상 프로젝트가 `.claude/` 는 있으나 harness-architect 구조가 아님)는 `[ASK]` 1건만 반환. 라우팅이 잘못 걸려도 에이전트 자신이 셀프 가드로 거절하여 false BLOCK 을 원천 차단.
+
+### Process Notes
+- 외부 사용자 보고서(`KBR/red-team-advisor-routing-issue.md`, 2026-05-21) 기반 P0 패치 두 항목(보고서 §4.1 description 스코프 명시 + §4.3 본문 Scope Guard) 적용.
+- 미적용 항목: §4.5 Dim 6/8/9/11/12 차원별 가드(P1, Scope Guard 로 1차 차단되므로 후속 사안) / §4.2 에이전트 이름 변경(P2, breaking change) / §4.4 별도 일반용 redteam 에이전트(P2, 신규 에이전트 1개 추가 필요).
+- 보고서 §7 인용대로 0.9.0 ~ 1.0.1 모든 캐시에서 동일 이슈 재현 가능. v1.0.2 부터 해소.
+
+## [1.0.1] - 2026-05-20
+
+**Phase 8 (MCP) 를 "리스트 + 설정 스니펫" 모델로 재설계 — `settings.json` 의 `mcpServers` 라는 (지원되지 않는) 위치로 안내하던 실제 버그를 제거하고, "MCP 후보 0건 침묵 스킵" 으로 사용자가 한 번도 단계를 인지하지 못하던 형해화를 차단했다.**
+
+배경: 사용자의 "Phase 8을 한 번도 제대로 본 적이 없다" 는 보고로 시작한 4-에이전트 팀 트랙 (진단 → 검증 → 설계 → 레드팀 → 구현 → 파일럿 → v3 재설계 → 레드팀 재검증). 초기 v2 (설치 자동화 강화) 를 실 동작 파일럿에서 검증한 결과 후보 패키지 npm 404 다수 발견 → 사용자 결정으로 v3 "리스트 + 스니펫" (에이전트가 설치 실행 안 함) 모델로 방향 전환. audit 패밀리·Fast Mode·경량 트랙 표현 정합화까지 동반 처리.
+
+### Fixed
+- **F-01 — `settings.json` 의 `mcpServers` 안내 폐기 (실제 버그)**: Claude Code 는 `settings.json` 에서 MCP 설정을 읽지 않는다 (`settings.json` 은 hooks·permissions·env·plugins 전용). 공식 문서 + `claude mcp add` 실증 + `~/.claude.json`·`.mcp.json` 실 파일 3중 확인으로 확정. 정답 경로: project 스코프 = 프로젝트 루트 `.mcp.json`, local 스코프 = `~/.claude.json` 의 `projects[...].mcpServers`, user 스코프 = `~/.claude.json` 최상위 `mcpServers`. `playbooks/hooks-mcp-setup.md` Part 2 + 잔존 오안내 7곳 (`README.md`, `README_EN.md`, `commands/harness-setup.md`, `knowledge/03/07/10/12-*.md`, `.claude/agents/phase-hooks.md`) 일괄 정정.
+- **F-05 — MCP 0건 침묵 스킵 차단 (형해화 핵심)**: 후보 ≥1건이면 `[ASK]` 강제 발행 (`[NOTE]` 금지) → 오케스트레이터가 AskUserQuestion 으로 사용자 노출. 후보 0건이어도 `.claude/rules/orchestrator-protocol.md` Phase 7-8 완료 알림에 `MCP: 추천 {N}건 — 사용자 설치 필요 / 추천 후보 없음` 1줄 상시 노출. "관심 없으면 즉시 건너뛴다" → "후보를 제시하고 사용자가 명시 결정" 으로 전환.
+- **F-02 — 후보 패키지명 낡음**: 1차 정정에서 `@anthropic/` → `@modelcontextprotocol/` 로 교체했으나 실 동작 파일럿에서 `server-fetch`·`server-sqlite` 등 npm 404 다수 발견 → v3 에서 하드코딩 테이블 자체 폐기.
+- **fit-audit Dim 7-A 구조적 false negative**: v3 권위 진술 (MCP 는 settings.json 에 없음) 에 정합되도록 스캔 대상을 `.mcp.json` / `~/.claude.json` 로 재정의. `settings.json` / `settings.local.json` 의 `mcpServers` 키 잔존은 레거시 결함 (MAJOR-DRIFT) 으로 검출하여 과거 버그 빌드 식별. 등급 체계 (MAJOR/MINOR/ALIGN/NOTE) 무변경.
+
+### Changed
+- **Phase 8 모델: 설치 자동화 → 리스트 + 설정 스니펫**: 에이전트는 `claude mcp add` 호출·패키지 설치를 **수행하지 않는다**. 산출물에 추천 리스트 + 사용자가 바로 복붙 가능한 `.mcp.json` 스니펫 + `claude mcp add` 명령 + 환경변수/인증 안내 + 출처 (npm 네임스페이스 + 1차 레퍼런스 URL) 를 기록. 책임 경계 = 조사·추천 (에이전트) / 등록·인증·비밀값 관리 (사용자).
+- **후보 발굴: 하드코딩 테이블 → 웹 검색**: WebSearch/WebFetch 로 현재 npm·MCP 생태계에서 신호별 후보 조사. 1차 출처 우선순위 (`modelcontextprotocol.io` / `modelcontextprotocol/servers` 레포 / Anthropic 공식 문서 / 1st-party 조직). stale-on-arrival 문제의 구조적 차단.
+- **`playbooks/final-validation.md` Step 5-B**: MCP 항목을 실 설치 검증에서 산출물 정적 검사로 재정의 — 1차 출처 + npm 네임스페이스 / Step 6.5 흔적 / 비밀값 평문 패턴 / 스코프별 스니펫·명령 형식.
+- **경량 트랙 `playbooks/setup-lite.md` 표현 정합**: "MCP 서버 포함" → "MCP 추천 후보로 기록", `훅/MCP 후보` → `훅 후보 + MCP 추천`. v3 책임 경계 (등록은 사용자) 와 일관.
+- **사용자 노출 문서 정정**: `ARCHITECTURE.md`, `README.md`, `README_EN.md`, `commands/help.md`, `commands/harness-setup.md` 의 Phase 7-8 단계 명칭을 "훅 설치 + MCP 추천 (리스트·스니펫)" 으로 통일.
+- **`.claude/agents/phase-hooks.md`**: description / Identity / Playbooks / Rules 를 "MCP 추천" + "등록 불수행" 으로 정합.
+
+### Added
+- **`playbooks/hooks-mcp-setup.md` Step 6.5 — MCP 공급망 경량 점검**: 네임스페이스 신뢰성 · 1차 출처 URL 의무 표기 · 임의 코드 실행 고지 · 출처 불명 시 `[ASK]`. 풀 보안 감사가 아닌 "출처 1줄 점검 + 사용자 고지" 게이트.
+- **`claude mcp list` 사전 조회 (Step 6 첫 단계)**: 기존 등록 MCP 와 중복 후보 자동 제외 — 동일 이름 → `[NOTE]` 제외, 동일 용도 다른 서버 → `[ASK]` 선택.
+- **Phase 7-8 완료 알림 1줄 (`orchestrator-protocol.md`)**: 침묵 스킵 차단의 핵심 가시성 장치.
+
+### Process Notes
+- 6 라운드 팀 기반 트랙. 산출물 12종 (`docs/phase8-mcp-improvement/01~11`) 보존.
+- 실 동작 파일럿 (스크래치 웹앱+DB 프로젝트, `claude mcp add` 실 실행 확인) 으로 v2 의 핵심 동작 7종 검증 후 사용자 결정으로 v3 전환.
+- audit 패밀리 일관성 확인: `harness-audit.md` · `ops-audit.md` 는 MCP 무참조 (변경 없음), `commands/audit.md` 통합 흐름 무영향, `fit-audit.md` Dim 7-A 만 갱신.
+- Fast Mode 호환: `hooks-mcp-setup.md` 에 Fast Mode 분기 없음. Phase 8 `[ASK]` 게이트는 Fast Mode 의미 ("Phase 1-9 [ASK] 무시 금지") 와 일관하게 발화.
+
+총 16 파일 변경.
+
+## [1.0.0] - 2026-05-19
+
+**정식 1.0 런치 — 생성 하네스의 모델 표기를 별칭으로 표준화하여 모델 정확성을 공식 문서 기준으로 확정하고, MIT 오픈소스 `mattpocock/skills` 의 작성 규율 일부를 선별 흡수.**
+
+대상 프로젝트에 설치되는 에이전트의 `model` 필드가 학습 데이터의 낡은 풀 ID(`claude-sonnet-4-5` 등)로 환각되던 문제를 별칭 전용 규약 + Phase 9 가드로 차단했다. 별칭은 Claude Code 공식 Model Configuration 문서가 "해당 패밀리의 최신 모델"로 정의하는 표준 메커니즘이며, 실제 모델은 사용자 실행 환경에서 해석된다.
+
+### Fixed
+- **생성 하네스 에이전트 모델 별칭 강제** — 대상 프로젝트에 설치되는 `.claude/agents/*.md` 의 `model` 필드를 풀 ID 대신 별칭(`opus`/`sonnet`/`haiku`)으로 통일. 기존에는 `phase-team` 이 생성 시 `model` 값을 학습 데이터의 낡은 풀 ID(`claude-sonnet-4-5`·`claude-opus-4-5` 등)로 환각하는 사례가 있었다. 별칭 `opus`/`sonnet`/`haiku`는 Claude Code가 해당 패밀리의 최신 모델로 해석하며(공식 Claude Code Model Configuration 문서), 실제 모델은 사용자 실행 환경(프로바이더·`ANTHROPIC_DEFAULT_*_MODEL` env)에서 결정된다. 풀 ID는 고정 스냅샷이라 시간이 지나면 retired되어 깨진다.
+  - `playbooks/agent-team.md` Step 5: `model` 필드 별칭 전용 규칙 + Guardrail 추가.
+  - `playbooks/final-validation.md` Step 3: Phase 9 가드 항목 18 신설 — `.claude/agents/*.md` 의 `model` 이 `claude-` 풀 ID 면 `[BLOCKING]` 검출.
+  - 대상에 복사되는 템플릿 에이전트 11개(`code-researcher`, `strict-coding-6step` 7개, `frontend-design` 2개) + 예시 1개(`examples/generated/.../researcher.md`)의 `model: claude-sonnet-4-6` → `model: sonnet` 로 전환.
+  - `playbooks/fit-audit.md` Dim 3: `model` 필드 파싱이 풀 ID 패턴(`claude-{family}-*`)만 매칭하던 것을 **별칭 + 풀 ID 정규화**로 수정 — 별칭 표기가 표준이 된 생성 하네스에서 모델 분포가 0으로 잡히는 회귀 차단.
+  - `playbooks/setup-lite.md` Step 2: 경량 트랙 에이전트 명세도 `model` 별칭 전용임을 명시 — 풀/경량 트랙 일관성 확보.
+  - `knowledge/` 예시 정리: `01-scope-hierarchy.md`·`02-composition-rules.md`·`03-file-reference.md`의 낡은 Claude 4.0 시대 모델 ID(`claude-sonnet-4-20250514`·`claude-opus-4-20250514`) 예시를 별칭으로 교체. `12-teams-agents.md`·`03-file-reference.md`의 에이전트 정의 예시 `model` 필드도 풀 ID → 별칭으로 통일 — 생성 에이전트가 참조하는 문서에 낡거나 풀 ID 형태의 모델 표기가 남지 않도록.
+  - 플러그인 자체 13개 Phase 에이전트(`.claude/agents/*.md`)는 v0.11.3 에서 의도적으로 풀 ID 핀 고정된 상태이므로 본 변경 대상이 아니다 — 대상 프로젝트에 설치되지 않는 내부 에이전트.
+
+### Changed
+- **`mattpocock/skills` 방법론 일부 흡수 (Tier 1)** — MIT 라이선스 오픈소스 `mattpocock/skills` 를 조사하여 작성 규율 3건을 선별 차용. 슬래시 커맨드 모음인 원본을 그대로 가져오지 않고, 우리 9-Phase 오케스트레이션에 맞는 텍스트 규율만 흡수:
+  - `playbooks/skill-forge.md`: SKILL.md `description` 작성 규율 섹션 신설 — description 은 스킬 자동 매칭의 *유일한* 신호이므로 3인칭 동작 서술 + "what + 발동 조건" 구조 + 트리거 키워드/호출구/파일타입 명시 + time-sensitive 정보 금지.
+  - `.claude/rules/orchestrator-protocol.md`: Rejected Alternatives 규약에 "기록 가치 3-조건 게이트"(실재한 후보 / 실 트레이드오프 기반 기각 / 맥락 없이 재제안 가능) 추가 — 기각 목록 noise 억제.
+  - `.claude/rules/output-quality.md`: File Generation Rules 항목 7 신설 — 참조 깊이 1단계 제한(A→B→C 참조 체인 금지). `playbooks/final-validation.md` Step 14에 시행 1줄 추가 — `@import` 대상이 또 다른 `@import`를 품으면 Phase 9가 `[NOTE]` 발행 (죽은 규칙 방지).
+
+## [0.11.3] - 2026-05-15
+
+**9-Phase 에이전트의 모델 배정을 작업 복잡도 기준으로 재정렬 — 적대적 리뷰 강화, 큐레이션·글쓰기 작업 비용 절감, `opus` 별칭 표기 통일.**
+
+배경: 풀 트랙 9-Phase 각 에이전트의 모델 배정이 작업의 개방형 판단 비중과 정합하는지 점검. 설계 핵심 Phase(3-4·5)는 Opus 로 적절했으나, 전체 품질 백스톱인 `red-team-advisor` 가 한 단계 낮은 모델이라 설계-검증 간 모델 역전이 존재했고, 리서치·스킬 글쓰기 Phase 는 큐레이션·구조화 글쓰기 성격에 비해 과다 배정 상태였다.
+
+### Changed
+- **`red-team-advisor` 모델 승격 (Sonnet → Opus)**: 산출물에 *없는 것*(암묵 가정·빠진 스텝·미묘한 모순)을 찾는 적대적 추론은 Opus 우위 영역이며, 이 에이전트는 매 Phase 직후 실행되는 9-Phase 전체의 단일 품질 백스톱이다. 설계 핵심 Phase 를 Opus 로 두고 그 검증자를 하위 모델로 두던 구조적 역전을 해소. Advisor Skip Gate(Phase 3-4·7-8 조건부 경량화)가 호출 수를 이미 억제하므로 비용 증가는 제한적.
+- **`phase-domain-research` 모델 강등 (Opus → Sonnet)**: Phase 2.5 의 본질은 도메인 표준 패턴 *큐레이션*(KB 우선 + 보조 웹 리서치)이며 아키텍처 설계가 아니다. 출처 신뢰성 판단 수준은 Sonnet 으로 충분 — 품질 손실 없이 비용 절감.
+- **`phase-skills` 모델 강등 (Opus → Sonnet)**: "어떤 스킬을 만들지"는 Phase 5(`phase-team`)에서 이미 결정되며, Phase 6 은 결정된 스킬의 SKILL.md(HOW)를 구조화 양식에 맞춰 작성하는 글쓰기 작업이다. Opus 대비 효익이 약해 Sonnet 으로 조정.
+- **모델 ID 표기 통일**: `phase-design`·`phase-team` frontmatter 의 `model: opus` 별칭을 풀 ID `claude-opus-4-7` 로 교체. 이제 13개 에이전트 전체가 풀 모델 ID(`claude-opus-4-7` / `claude-sonnet-4-6` / `claude-haiku-4-5-20251001`)로 일관 표기.
+
+### Design Notes
+- **변경 후 풀 트랙 모델 배정**: phase-setup=Sonnet, phase-domain-research=Sonnet, phase-design=Opus, phase-team=Opus, phase-skills=Sonnet, phase-hooks=Sonnet, phase-validate=Sonnet, red-team-advisor=Opus, security-auditor=Haiku. Opus 는 "다중 제약이 상호작용하는 개방형 아키텍처 판단"(설계 + 적대적 검증)에만 한정, 휴리스틱·체크리스트·큐레이션·정형 글쓰기는 Sonnet, grep 수준 패턴 매칭은 Haiku.
+- **`security-auditor` Haiku 유지**: `red-team-advisor.md` Dim 11 이 명시하듯 grep 수준 패턴 매칭 전용이라 Haiku 가 정당. 본 변경 대상 아님.
+
+총 5 파일 변경 (.claude/agents/ 5개 frontmatter).
+
+## [0.11.2] - 2026-05-13
+
+**v0.11.1 audit 패치의 자체 레드팀 검증 누락 회귀 해소 — Red-team Advisor 사후 리뷰에서 발견된 BLOCK 2건 + ASK 5건 + NOTE 3건 일괄 반영.**
+
+배경: v0.11.1 patch (audit 커버리지 보강) 를 자체 레드팀 검증 없이 릴리즈한 회귀를 사용자가 즉시 지적. red-team-advisor 사후 소환 결과 grep 패턴 침묵 실패·상반 신호 병합 위험·권고 강도 부적절 등 실동작 결함 다수 발견. 본 patch 는 그 검증을 사후 보완.
+
+### Fixed (BLOCK 해소)
+- **`playbooks/fit-audit.md` Dim 3.5 + `playbooks/harness-audit.md` 특례 — grep 패턴 침묵 실패**: v0.11.1 의 단일 패턴 `^- A[789]\.|^- A10\.` 은 `01-discovery-answers.md` 산출물 형식이 자유 형식일 경우 매칭 0건 → MEDIUM finding 미발행 (False Negative). v0.11.2 에서 **복합 패턴** `iE 'A[3789]|A10|사용[ _-]?빈도|운영[ _-]?성숙도|적정[ _-]?규모|Agreed[ _-]?Scope'` 로 교체 + 매칭 실패 시 `Unknown` 보수적 처리 명시.
+- **`commands/audit.md` SSoT 공유 항목 충돌 처리 — 상반 신호 병합 위험**: ops-audit Dim A (Session Recovery 부재 RISK-HIGH) ↔ fit-audit Dim 3.5 F7 (Session Recovery 자동 부여 MAJOR-DRIFT) 동시 발행 시 Jaccard 70% 알고리즘이 오병합 위험. **예외 명시 추가** — 의미적 모순 페어(`추가/필요/부재 ↔ 과잉/축소/Drift`)는 병합 금지, 양쪽 모두 별도 노출. 일반화 휴리스틱으로 향후 유사 페어 자동 감지.
+
+### Changed (ASK 해소)
+- **F1~F3 권고 강도 완화 (audit 시점 UX 충격 회피)**: build 측 Dim 14 는 "에이전트 생성 직전 차단" 이지만 audit 측 Dim 3.5 는 *이미 사용 중인 에이전트* 를 다룬다. "삭제" 권고를 **"다음 재빌드 시 적정선 재합의"** 로 완화. 처리 경로 안내 텍스트 전면 재작성 — 즉시 삭제 옵션 제거, harness-setup 재실행 후 Scope Confirmation Gate 가 자동 축소 옵션 제시하는 흐름 강조.
+- **heuristic-only-mode A3 추정 실패 처리 명시**: A3 = Unknown 시 F3 룰 skip (False Positive 회피 — 팀 프로젝트를 솔로로 오판해서 MAJOR 발행 방지). A7/A8/A10 은 추정 자체를 금지 — pre-v0.11.0 빌드 사실 자체가 신호.
+- **harness-audit 특례 `[ASK]` 처리 경로 명시**: 통합 리포트 Recommendation 텍스트로 노출 (오케스트레이터 별도 AskUserQuestion 수집 아님). `commands/audit.md` 의 "read-only, no AskUserQuestion" 명시와 일관. 사용자가 보고서를 읽고 다음 세션에서 자율 선택.
+- **`playbooks/fit-audit.md` Step 2 Workflow 순서**: `Dim 1 → Dim 2 → Dim 3 → Dim 3.5 → Dim 4 → Dim 5 → Dim 7` 로 Dim 3.5 명시 삽입. v0.11.1 에서 Step 2 목록에 누락되어 에이전트가 건너뛸 구조적 위험 해소.
+
+### Added (NOTE 해소 + 일관성 확보)
+- **fit-audit Dim 3.5 F8 / F9 룰 신설** — build 측 R7 (playbook 과다) / R9 (슬림 + Complexity Gate) 의 audit 버전. v0.11.1 에서 R1~R9 9개 룰 중 R7/R9 에 대응하는 F 룰이 누락되어 build/audit 일관성 깨졌던 점 해소. F8 (playbook ≥ 10 + 평균 ≥ 1.5 → MINOR), F9 (A10 = 슬림 + Complexity Gate S/M/L 흔적 → MAJOR).
+- **bash glob 환경 의존 픽스**: v0.11.1 의 `playbooks/**/*.md` 는 bash globstar 비활성 환경에서 동작 안 함. `find {대상}/playbooks ... -type f -exec grep -lE ...` 형식으로 교체.
+- **Backward Compatibility — Coverage Gaps 명시**: `docs/` 자체가 없는 매우 오래된 하네스(v0.4.x 이전)는 Dim 3.5 진단 불가 → `[NOT-APPLICABLE]` 표기 + 통합 보고서 Coverage Gaps 에 "docs/ 부재 — 의도-규모 진단 skip" 한 줄 기록.
+
+### Design Notes
+- **자체 회귀 — 레드팀 누락의 메타 교훈**: v0.11.0 plan 은 9개 task 를 명시 분해 후 진행했으나 v0.11.1 audit 패치는 사용자 지적 직후 4개 task 로 즉흥 분해하면서 "Red-team Advisor 사후 리뷰" 단계를 task 목록에 포함하지 않은 회귀. 향후 patch 도 build 패치와 동일한 워크플로우 강도 (plan → execute → red-team → release) 를 따라야 한다는 메타 결론. CONTRIBUTING.md 후속 patch (별도) 에 반영 예정.
+- **build/audit 1:1 매핑 완성**: v0.11.2 에서 R1~R9 와 F1~F9 의 1:1 매핑이 완성됨. 향후 build 측 임계치 변경 시 audit 측도 동반 갱신 필수. 회귀 가드: grep `R[0-9]+|F[0-9]+` 매칭 수가 양쪽 동일해야 한다는 검증을 향후 `scripts/` 에 추가 검토.
+- **권고 강도의 audit/build 차이**: 동일 임계치 R/F 라도 권고 강도는 audit 시점이 항상 약하다 (이미 사용 중 에이전트 보호). 향후 R/F 룰 추가 시 audit 버전은 자동으로 "다음 재빌드 시 축소" 권고 형식 사용.
+
+총 4 파일 변경 (118 insertions, 12 deletions).
+
+## [0.11.1] - 2026-05-13
+
+**v0.11.0 의도-규모 견제 시스템의 audit 커버리지 보강 — `/harness-architect:audit` 가 pre-v0.11.0 빌드 또는 현재 빌드의 의도-규모 미스매치를 사후 진단.**
+
+배경: v0.11.0 은 build 측 (`/harness-architect:harness-setup`) 에 Advisor Dim 14 + Phase 0 A7~A10 + Scope Confirmation Gate 를 도입했으나, audit 측 (`/harness-architect:audit`) 3개 sub-auditor (harness/ops/fit) 어디에도 v0.11.0 새 개념이 반영되지 않은 누락. 결과적으로 v0.10.x 의 50+ 파일 incident 와 동일 패턴의 기 설치된 하네스를 audit 가 진단해도 의도-규모 격차를 감지하지 못함. 본 patch 는 build/audit 양쪽 커버리지를 정합화.
+
+### Added
+- **`playbooks/fit-audit.md` Dim 3.5 "의도-규모 미스매치 (Intent-Scope Mismatch)"** — Dim 14 의 audit 버전. baseline (`01-discovery-answers.md`) 의 A3/A7/A8/A10 답변과 현재 산출물 규모 (.claude/agents, reviewer 수, HITL gate, playbook 수) 격차를 7개 룰 (F1~F7) 로 검사. A10 답변 누락 (pre-v0.11.0 빌드) 시 F4 fallback 룰로 [MINOR-DRIFT] 발행. 격차 발견 시 처리 경로 3-선택 안내 (harness-setup 재실행 / 수동 편집 / 유지).
+- **`playbooks/harness-audit.md` Phase 4 "v0.11.0 Intent-Scope 베이스라인 누락" 특례** — `01-discovery-answers.md` 의 Pre-collected Answers 에서 A7/A8/A10 grep 매칭이 < 3 이면 단일 MEDIUM finding 발행. 자동 패치 불가 (사용자 입력 필요), 대신 Escalation 으로 재실행 / 수동 보충 / 유지 3-선택 안내. fit-audit Dim 3.5 와 상호 보완 (베이스라인 존재 검사 vs 실제 격차 검사).
+- **`commands/audit.md` Recommendation 우선 노출 규칙** — harness-audit MEDIUM (베이스라인 누락) + fit-audit Dim 3.5 MAJOR-DRIFT (실제 격차) 동시 발행 시 통합 리포트 Recommendation 최상단에 "의도-규모 견제 부재 — harness-setup 재실행 시 A10 인터뷰 + Scope Confirmation Gate 자동 축소 옵션" 안내.
+
+### Design Notes
+- **build 와 audit 의 상호 보완**: build (v0.11.0) = 신규 하네스의 사전 차단, audit (v0.11.1) = 기존 하네스의 사후 감지. 둘 다 동일한 임계치 (R1~R9 / F1~F7) 사용으로 일관성 유지.
+- **자동 패치 vs 사용자 입력**: Intent Gate 베이스라인 (v0.10.0) 은 정적 템플릿 복사라 자동 패치 가능했지만, A7~A10 베이스라인은 사용자 답변 필수라 자동 패치 불가. 대신 audit 가 누락을 명시 노출 + harness-setup 재실행 경로를 권장하는 방식.
+- **False Positive 방어**: fit-audit Dim 3.5 의 F4 룰 (pre-v0.11.0 빌드 + 에이전트 ≥ 7) 은 MINOR-DRIFT 로만 발행 — v0.11.0 이전 빌드는 *원래* 의도-규모 견제가 없었으므로 단순 "Unknown" 만으로 MAJOR 승격 금지. 정량적 격차 (F1~F3·F5~F7) 가 있을 때에만 MAJOR.
+
+## [0.11.0] - 2026-05-13
+
+**의도-규모 미스매치 견제 시스템 도입 — Advisor Dim 14 + Phase 0 압축 인터뷰 (A7~A10) + Scope Confirmation Gate + Fast Keyword 의미 재정의.**
+
+배경: v0.10.x 세션에서 솔로 + "빠르게" + 주 1-2회 회의록 작성이라는 사용자 의도와 정반대로 11 에이전트 + 14 playbook + 5 reviewer + HITL 2-gate + Session Recovery 의 50+ 파일 하네스가 생성된 incident. 9-Phase 가 모두 정의대로 동작했고 final validation 도 통과했지만 사용자가 "오버엔지니어링" 으로 평가. 두 축의 문제: (1) Advisor 의 Dim 1~13 중 어디에도 "산출물 규모가 사용자 발화 의도와 매칭되는가" 차원이 없음, (2) "빠르게" 키워드가 Phase 0 에서 "질문 최소화", Phase 5-9 에서 "Advisor/Gate 생략 정당화" 로 재해석되어 사용자 비공지. 본 릴리즈는 두 축을 모두 견제하는 3-layer 방어선 도입.
+
+### Added
+- **`playbooks/design-review.md` — 신규 Dimension 14 "Scope-Intent Match"**. Phase 3-4·5·6 산출물에 대해 사용자 의도 신호 (A10 Agreed Scope, A7 사용 빈도, A8 운영 성숙도, A3 솔로/팀, "빠르게" 키워드) 와 산출물 규모 (에이전트 수, reviewer 수, HITL gate 수, playbook 수, Session Recovery 자동 부여) 격차를 검사. 9개 임계치 룰 (R1~R9) + 동일 도메인 운영 코드 참조 비교. **복잡도 게이트와 Skip Gate 우회 불가** (Dim 6 보안 격). BLOCK 발행 시 사용자 3-선택 (산출물 축소 / 의도 신호 보정 / 그대로 진행).
+- **`.claude/rules/orchestrator-protocol.md` Phase 0 인터뷰 A7~A10**. A7 사용 빈도 (1회성·실험 / 저빈도 / 중빈도 / 고빈도·운영), A8 운영 성숙도 (개인 도구 / 팀 공유 / 운영 인프라), A9 작업 복잡도 자기 평가, **A10 적정 규모 합의 (AI 추정 → 사용자 확인)** — 슬림 / 중간 / 풀 3옵션 + AI 가 description 본문에 자기 추정 사유 노출 (라벨 부착 금지). A10 답변은 Phase 3-6 에이전트 프롬프트의 `[Agreed Scope]` 로 전달.
+- **`.claude/rules/orchestrator-protocol.md` 신규 섹션 "Fast Keyword Semantics"**. "빠르게" / "--fast" 는 트랙 단축이 아니라 **운영 모드 전환** 신호. Phase 0 압축 깊이 인터뷰 + AI 자율 추론 + A10 1회 합의 + 자율 운영 + 자체 견제 강화. Skip Gate 외 경로 생략 금지 사유 5종 명시 (Advisor 생략 정당화 / Model Confirmation Gate 생략 / Scope Gate 생략 / [ASK] 무시 / "BLOCK 없으니 상식적 생략").
+- **`.claude/rules/orchestrator-protocol.md` 신규 섹션 "Scope Confirmation Gate (Phase 5 직후)"**. Dim 14 가 BLOCK 을 놓친 경우의 **최종 안전망**. 에이전트 수 ≥ 5 OR reviewer 수 ≥ 2 OR HITL gate ≥ 1 시 발화. A10 합의와 현재 규모 격차를 정량 노출. 3-선택 (이 규모로 진행 / 축소 재소환 / 의도 재확인). Phase 6 Model Confirmation Gate 와 별개로 직렬 실행.
+- **`.claude/rules/orchestrator-protocol.md` 트랙 판별 10번째 조건**. A7 ∈ {1회성·실험, 저빈도} AND A8 = `개인 도구` AND A10 ∈ {슬림, 중간} 시 강한 경량 트랙 신호 — 다른 8개 조건 일부 불충족이어도 경량 트랙 제안 유지.
+- **`.claude/rules/question-discipline.md` 신규 섹션 "Recommended Label Discipline"**. AskUserQuestion 옵션 라벨에 `(권장)` 자체 부착 금지. 슬래시 커맨드 정의·플러그인 규칙·플레이북·KB 명시 정의 시에만 허용 (인용 근거 의무). 추론 표현은 옵션 description 본문에. v0.10.x incident 의 "(권장)" 모델 자체 부착 사례 재발 차단.
+- **`playbooks/final-validation.md` 신규 Step 5.5 "Advisor Completion Audit"**. `docs/{요청명}/*.md` 의 frontmatter `advisor_status` 전수 점검. Phase별 기대값 매트릭스 + `:skip-gate` 접미사 허용 여부 + Scope Confirmation Gate / Model Confirmation Gate 통과 여부 + 미해결 [ASK]/[BLOCKING] 잔존 검사. 오케스트레이터 자체 Advisor 생략 차단의 final-validation 레이어.
+
+### Changed
+- **`playbooks/fresh-setup.md` "Fast Track Mode" → "Fast Mode" 로 이름 변경 + 전면 재작성**. v0.10.x 의 "Q5~Q9 합리적 기본값" 패턴 폐기. 압축 깊이 인터뷰는 오케스트레이터 책임 — 본 스킬 실행 시점에 A1~A10 누락이면 `[BLOCKING]` Escalation. A10 = `슬림` 시 Step 3-D/3-E 자동 주입을 [ASK] 강등. Fast Mode 가 단축하는 것 (질문 분산) 과 단축하지 않는 것 (Phase 수·Advisor·Scope Gate·산출물 규모) 명시. Pre-collected Answers 에 A6/A7/A8/A9/A10 추가. Step 1.5 User-Declared Structure 에 사용 강도·운영 성숙도 발화 추출 카테고리 추가 (A7/A8 답변과 불일치 시 [ASK]).
+- **`commands/harness-setup.md` Phase 0 출력 규칙 보강**. 트랙별 안내문 정정 — "Fast Mode" 로 변경, 예상 소요는 A10 합의 기준 (슬림 25-35분 / 중간 40-55분 / 풀 60분+). Phase 0 옵션 description 기준 섹션 확장 — A5/A6 + 신규 A7/A8/A9/A10 description 가이드 + A10 옵션 본문 정량 견적 표기 의무 + "(권장)" 라벨 부착 규칙. 마스터 워크플로우 표에 Phase 5+ "Scope Confirmation Gate" 행 추가. Dim 14 "Scope-Intent Match" 동작 안내 추가.
+- **`.claude/rules/orchestrator-protocol.md` Advisor Skip Gate 보강**. "Skip Gate 외 경로 생략 금지 (자체 우회 차단)" 항목 신설. thinking 안에서 "사용자가 빠르게 원함" / "BLOCK 없으니 상식적 생략" / "final-validation 이 잡아줄 것" 인용 금지. 위반 시 Phase 9 Advisor Completion Audit 가 BLOCK 으로 감지.
+- **`.claude/rules/orchestrator-protocol.md` Phase Gate 검증 절차에 "[ASK] 차단" Step 신설**. `validate-phase-artifact.sh` stdout 의 Escalation 카운트를 파싱하여 미해결 [ASK]/[BLOCKING] ≥ 1 시 다음 Phase 진입 차단. 오케스트레이터 thinking 내 자체 결정으로 [ASK] 처리 불가. 사용자 일괄 답변 후 산출물 `## Escalations` 에 `→ [RESOLVED]` 마커 Edit 추가.
+- **`scripts/validate-phase-artifact.sh` Escalation 카운트 출력 추가**. stdout 에 `ESCALATION_COUNT: ASK=N, BLOCKING=M, RESOLVED_ASK=R, RESOLVED_BLOCKING=R'` 한 줄. exit code 는 구조 검증만 — Escalation 카운트는 orchestrator 가 별도 차단.
+- **`playbooks/pipeline-design.md` `[Agreed Scope]` 입력 처리 신규 섹션**. 슬림/중간/풀 별 reviewer / HITL gate 상한. `mandatory_review` 분류라도 A10 = 슬림이면 `review_exempt: agreed_scope_slim` 허용.
+- **`playbooks/agent-team.md` `[Agreed Scope]` 입력 처리 신규 섹션**. 슬림 ≤ 4 / 중간 ≤ 7 / 풀 무제한 에이전트 수 상한. Agent Model Table 에 Agreed Scope 명시. 동일 도메인 운영 코드 인용 시 격차 사전 자기 검사.
+- **`playbooks/skill-forge.md` `[Agreed Scope]` 입력 처리 신규 섹션**. 슬림 SKILL.md ≤ 5 / 중간 ≤ 10 / 풀 무제한. 슬림에서 SKILL.md 통합 권장 (MRSO 평면 구조 참조).
+
+### Design Notes
+- **3-layer 방어선 설계**: Layer 1 = Phase 0 압축 인터뷰 A10 (암묵적 합의 방지), Layer 2 = Dim 14 (산출물 규모 검사), Layer 3 = Scope Confirmation Gate (사후 안전망). 어느 한 층이 뚫려도 다음 층이 잡는 구조.
+- **"빠르게" 의 정확한 의미** (사용자 정정 기반): 트랙 단축이나 산출물 축소가 아니라 *AI 가 사용자 발화·미발화 맥락·프로젝트 복잡도를 종합 추론해서 합리적 설계 파이프라인을 자율 운영*. 동시에 *암묵적 합의가 생기지 않도록* Phase 0 에서 압축 인터뷰로 맥락 한 번에 수집. 풀 9-Phase 식 분산 질문은 금지.
+- **Dim 6 (보안) 와 Dim 14 (의도-규모) 동일 격**: 둘 다 복잡도 게이트와 Skip Gate 모두 우회 불가. 산출물 규모 미스매치는 보안 위반과 같은 격의 사용자 피해 (시간·토큰·인지 부담 = 시스템 신뢰 침식) 로 본다.
+- **임계치 튜닝 보수적**: Dim 14 의 9개 임계치 (R1~R9) 는 초안. 실제 사용 데이터를 모은 뒤 v0.11.x patch 에서 조정. false positive 보다 false negative 비용이 더 크므로 초기는 보수적 (BLOCK 우선).
+- **Backward compatibility**: 기존 산출물 (frontmatter 없는 구형) 은 Advisor Completion Audit 에서 `[NOTE]` 로만 기록 (BLOCK 아님). v0.11.0 이전 세션 재개 호환.
+
+## [0.10.3] - 2026-05-13
+
+**런타임 버그 픽스 — `subagent_type` 네임스페이스 prefix 누락 (Agent type not found 에러 해소).**
+
+플러그인 매니페스트(`plugin.json`)에 `"name": "harness-architect"` 가 등록되어 있으면 Claude Code 런타임이 모든 에이전트를 `harness-architect:<name>` 으로 네임스페이스 처리한다. 그러나 오케스트레이터·playbooks·command 파일들이 `subagent_type: "phase-setup"` 처럼 prefix 없이 소환을 시도해 외부 프로젝트(설치된 플러그인 컨텍스트)에서 `Error: Agent type 'phase-setup' not found` 가 발생했다. 개발 레포 내부에서는 `.claude/agents/*.md` 가 프로젝트-로컬 에이전트로도 접근 가능해 prefix 없는 호출이 우연히 성공했기 때문에 그동안 노출되지 않았다.
+
+### Fixed
+- **`.claude/rules/orchestrator-protocol.md`** — Phase 2.5 / Phase 1-2 / security-auditor 병렬 소환 / red-team Advisor 4개 소환 템플릿에 `harness-architect:` prefix 추가.
+- **`commands/harness-setup.md`** — `필수 패턴` 예시 prefix 추가.
+- **`commands/audit.md`** — 3개 auditor (harness/ops/fit) 병렬 소환 prefix 추가.
+- **`commands/harness-audit.md`, `commands/ops-audit.md`, `commands/fit-audit.md`** — 각 auditor 직접 소환 prefix 추가.
+- **`playbooks/final-validation.md`** — `security-auditor` 소환 예시 prefix 추가.
+
+### Changed
+- **`CONTRIBUTING.md` 명명 규약** — 네임스페이스 prefix 규칙 명시 + 개발 모드(`claude --plugin-dir .`) 와 설치 모드 모두 동일하게 네임스페이스가 적용됨을 강조. 향후 신규 `subagent_type` 호출 작성 시 prefix 누락 방지.
+- **`CLAUDE.md`, `ARCHITECTURE.md`** — 기여자 가이드 예시도 prefix 포함 형태로 갱신 (일관성).
+
+### Design Notes
+- 외부 검증은 작성 시점에 자동화하지 않음. 이번 픽스는 grep 기반 회귀 방지로 충분 — `subagent_type:\s*"(phase-[a-z-]+|red-team-advisor|security-auditor|ops-auditor|fit-auditor|harness-auditor)"` 가 매칭 0건이 되도록 유지하는 것이 회귀 가드. 추후 `scripts/` 에 prefix 검증 스크립트 도입 검토.
+
+## [0.10.2] - 2026-05-07
+
+**Phase 3+4 통합 — `phase-design` 단일 에이전트 (workflow-design → pipeline-design 순차 실행).**
+
+블루팀/레드팀 메타 분석에서 Phase 3(workflow) 의 `## Context for Next Phase` 출력이 Phase 4(pipeline) 의 Step 1 입력과 1:1 릴레이라는 사실이 확인됨. 두 Phase 사이 200단어 Summary 압축·재Read·Advisor 별도 호출이 모두 단순 오버헤드. 단일 에이전트(opus) 가 두 플레이북을 순차 Read·실행하여 두 산출물 (`02-workflow-design.md` + `03-pipeline-design.md`) 을 같은 컨텍스트에서 생성. 산출물 분리 유지로 후속 Phase 5/6 입력 계약과 frontmatter 기반 재개 프로토콜 보존.
+
+### Changed
+- **`.claude/agents/phase-design.md`** (신규) — Phase 3+4 통합 에이전트. workflow-design → pipeline-design 순차 실행. **재개 분기(Idempotency Gate)** 명시: 02 만 존재 + 03 미존재 시 workflow-design 스킵하고 02 를 Read 입력으로만 사용 (덮어쓰기 금지). 두 파일 모두 존재 시 명시적 `[resume_from]` 플래그 없이는 BLOCKING Escalation 으로 종료. CLAUDE.md `@import` 두 줄 (`02-workflow-design.md`, `03-pipeline-design.md`) 추가 책임 명시 (idempotent — 이미 존재하면 추가 안 함).
+- **`.claude/agents/phase-workflow.md`, `phase-pipeline.md`** (삭제) — phase-design 으로 통합.
+- **`.claude-plugin/plugin.json`** — 에이전트 등록 갱신 (phase-workflow + phase-pipeline → phase-design).
+- **`.claude/rules/orchestrator-protocol.md`** — Phase-to-Agent 매핑 / Phase Gate / Skip Gate / Phase 별 Context for Next Phase 표 갱신. Phase 5 진입 조건은 `02-workflow-design.md` AND `03-pipeline-design.md` 두 파일 모두 존재. **Skip Gate 강화**: Phase 3-4 통합 산출물의 경우 Escalations 합산 평가 + `validate-phase-artifact.sh` 가 02·03 두 파일 모두 1회차 exit 0 이어야 진입 허용 (단일 파일만 통과 시 차단).
+- **`playbooks/fresh-setup.md`, `playbooks/setup-lite.md`, `playbooks/domain-research.md`** — Next Steps 의 다음 Phase 호칭을 `phase-design` 으로 갱신.
+- **`ARCHITECTURE.md`, `README.md`, `README_EN.md`, `commands/harness-setup.md`** — Phase 매핑 표 통합 (Phase 3-4 단일 행).
+
+### Design Notes
+- **모델 정책**: 통합 에이전트는 opus 단일. 이전 phase-workflow 의 sonnet 비용 회귀가 발생하나, Phase 4 의 opus 요구가 통합 컨텍스트 전체를 지배하므로 일관성 우선. 워크플로우만 단독 재작성하는 케이스(Advisor BLOCK 으로 02 만 재실행) 는 Idempotency Gate 의 케이스 C 분기로 사용자 명시 결정 후 진행.
+- **Advisor 호출 횟수**: 2회 → 1회. 두 산출물 합산 리뷰. Dim 12(파이프라인 리뷰 게이트) 는 03-pipeline-design.md 단독 검사 가능하므로 통합 후에도 보안 게이트 약화 없음.
+- **재개 안전성**: Idempotency Gate 명시로 부분 실패(02 작성 후 03 직전 중단) 재소환 시 Advisor 통과한 워크플로우 설계 덮어쓰기 위험 제거.
+- **Red-team 리뷰 1회 반영**: BLOCK 2(idempotency 미정의 / CHANGELOG 누락) + ASK 2(@import 책임자 / Skip Gate 두 파일 기준) 모두 반영 후 출시.
+- **보류된 통합**: Phase 5+6 통합은 TeamCreate 병렬 SKILL 제작의 race 우려로 별도 설계 라운드로 미룸.
+
+## [0.10.1] - 2026-05-06
+
+**Lean CLAUDE.md / SKILL.md SSoT 가드 도입 — anti-duplication 원칙을 모든 슬래시 커맨드 경로(/harness-setup, /audit, /harness-audit, /ops-audit) 에 빌트인.**
+
+외부 사용 사례(Project-Integration-Agent, 4 워크플로우 × 7단계 × 5-역할 다중 에이전트 하네스) 에서 CLAUDE.md ↔ SKILL.md 워크플로우 상세 중복으로 매 세션 시작 시 11.2k 토큰의 콜드 컨텐츠가 강제 로드되는 문제가 측정됨(`Memory files` 카테고리 5.8% of 200k window). 리팩터링으로 6.9k 토큰까지 37.5% 절감 가능함이 검증됐고, 동일 효과를 플러그인 산출물 전체에 자동화하기 위한 가드를 도입.
+
+기존 200줄 캡(`output-quality.md`) 만으로는 "무엇을 두지 말라" 가 명시되지 않아 워크플로우 정체성·전략표·N-step·품질 기준·anti-pattern 정의가 CLAUDE.md ↔ SKILL.md 양쪽에 동시 존재하는 SSoT 위반이 빌드·감사 두 시점에서 모두 미감지. 이 변경은 SKILL.md 를 워크플로우 상세의 SSoT 로 선언하고, CLAUDE.md 는 라우터(router) 역할로 한정한다.
+
+### Added
+- **`.claude/rules/output-quality.md` Item 2** (신규, always-apply) — `SKILL.md = SSoT for workflow detail`. 다중 에이전트 하네스(에이전트 ≥ 2 또는 SKILL.md ≥ 4) 에서 CLAUDE.md 본문 중복 금지 + 한 줄 요약 + 포인터 사용 규약. 진입점별 판별 공급원 4종(fresh-setup 휴리스틱 / final-validation 파일 카운트 / audit 파일 카운트) 명시. 단일 에이전트 프로젝트는 fragmentation 위험으로 soft warning.
+- **`playbooks/fresh-setup.md` Step 6.1** — Anti-duplication gate. CLAUDE.md 작성 시점(Phase 1-2) 의 시점 보정을 위해 휴리스틱 사전 신호 4종(A6 멀티 선택 / Step 3-A 에이전트 신호 / Step 3-B Strict 신호 / 사용자 발화 어휘) 으로 게이트 발동. 게이트 발동 시 워크플로우 매트릭스 표 1개 + 핵심 원칙 한 줄 요약 + SSoT 포인터로 대체. 예측 빗나감 시 phase-setup 재소환으로 안전 보정.
+- **`playbooks/cursor-migration.md` Phase 6** — 변환 시점 anti-dup gate. 변환된 SKILL.md ≥ 4 또는 에이전트 정의 ≥ 2 시 동일 원칙 적용.
+- **`playbooks/skill-forge.md` 본체 권장 구조 직후** — Self-Containment 원칙 신규 섹션. SKILL.md 는 CLAUDE.md 없이도 실행 가능해야 한다는 자기완결성 의무. 케이스 A(`.claude/skills/`) / 케이스 B(`playbooks/`) 무관 적용.
+- **`playbooks/final-validation.md` Step 3 항목 14** — CLAUDE.md ↔ SKILL.md 본문 헤더 교집합 검사 추가. 교집합 ≥ 3 (SKILL 표준 섹션명 6개 — `Goal`/`Workflow`/`Output Contract`/`Guardrails`/`Focus`/`Frontmatter` — 제외) 시 NOTE, 다중 에이전트 하네스에서는 BLOCK 후보로 승격. 빌드 시점 BLOCK vs audit 재진입 MEDIUM 의 심각도 비대칭 의도 명시.
+- **`playbooks/harness-audit.md` Phase 2** — `CLAUDE.md ↔ SKILL.md duplication (SSoT 위반)` MEDIUM 행 신설. audit 재진입은 단일 소유자 원칙 보호로 자동 재작성 금지·권고만. 표준 섹션 제외 목록 6개 동기화.
+- **`playbooks/ops-audit.md` Dim E** — 기존 Jaccard 70%(playbooks ↔ SKILL.md) 검사 + 신규 CLAUDE.md ↔ SKILL.md 교집합 ≥ 3 검사 통합. SSoT 참조처 4종(final-validation #14·#16, output-quality Item 2, harness-audit Phase 2) 동시 수정 의무 명시.
+
+### Design Notes
+- **단일 소유자 원칙 권한 차이로 인한 심각도 비대칭**: Phase 9(빌드 시점) 는 fresh-setup 으로 신규 생성한 하네스 검증이라 단일 소유자 원칙이 살아 있어 BLOCK 차단·재작성 안전. Audit 재진입은 단일 소유자 원칙의 명시적 예외(자동 재작성 금지) 에 묶여 MEDIUM·권고 수준에 머문다. 두 진입 시점의 권한 차이로 인한 의도된 설계.
+- **표준 섹션명 SSoT 동기화**: `Goal`/`Workflow`/`Output Contract`/`Guardrails`/`Focus`/`Frontmatter` 6개 항목은 final-validation #14, ops-audit Dim E, harness-audit Phase 2 표 3곳에서 정확히 일치해야 한다. 변경 시 모든 참조처 동시 수정 의무를 각 시행 지점에 명시.
+- **단일 에이전트 fragmentation 회피**: 단일 에이전트 하네스(에이전트 ≤ 1) 는 SKILL.md 가 1~2개에 불과하므로 분리가 오히려 fragmentation 을 유발. 모든 시행 지점에서 NOTE/RISK-LOW 로 자동 강등하는 Pre-check 일관 적용.
+- **Red-team 리뷰 1회 반영**: BLOCK 1(ops-audit SSoT 주석 명료화) + ASK 3(시점 보정 / 정보 공급원 / 심각도 비대칭) + NOTE 3(제외 목록 동기화 / 케이스 무관 적용 / 드리프트 감지) 모두 반영 후 릴리즈.
+
+## [0.10.0] - 2026-04-23
+
+**Intent Gate 베이스라인 — 하네스 대상 프로젝트의 메인 세션이 작업 요청을 받으면 첫 턴에 의도·맥락을 확인하도록 강제하는 규칙·스킬 2층 구조 도입.**
+
+기존 하네스 결과물은 사용자 요청을 암묵적으로 해석해 리서치·계획 단계로 진입하는 경우가 많아 잘못된 방향이 고정되는 문제가 있었다. 예: "v3 Windows GUI 를 v4 웹앱으로 포팅" 요청에서 사용자의 실제 의도(v4 standalone + v3 폐기 + GitHub 공개) 를 확인하지 않고 "원본 v3 임포트" 방향으로 설계를 시작. 이 변경은 모든 대상 프로젝트에 **무조건 설치되는 Intent Gate 베이스라인** (규칙 1 + 스킬 1 + CLAUDE.md 섹션) 을 도입하여 이런 되돌림 비용을 "첫 턴 질문 1회" 수준으로 묶는다.
+
+### Added
+- **`.claude/templates/common/rules/intent-gate.md`** (신규, alwaysApply 규칙 템플릿) — 대상 프로젝트 `.claude/rules/intent-gate.md` 로 무조건 복사. 트리거 / 면제 / 의무 절차 / 금지 사항 / 다른 always-apply 규칙과의 충돌 시 우선 규약 정의.
+- **`.claude/templates/common/skills/intent-clarifier/SKILL.md`** (신규, 질문 진행 스킬 템플릿) — 대상 프로젝트 `.claude/skills/intent-clarifier/` 로 무조건 복사. 5단계 절차 (요청 정제 → 의사결정 분기 열거 → 맥락 공백 식별 → AskUserQuestion 질문 실행 → 충분성 재점검 루프, 최대 3 회차). 규칙이 호출하는 실행 계층.
+- **`playbooks/fresh-setup.md` Step 3-F** (신규, 무조건 판별 없음) — 위 2개 템플릿을 판별 없이 대상 프로젝트에 복사. CLAUDE.md 최상단에 "작업 시작 전" 섹션 prepend 지시. Step 5 생성 계획 초안 트리 업데이트. Step 6 의 `.claude/rules/*.md` / `.claude/skills/` 복사 지시(3-ter) 추가.
+- **`playbooks/setup-lite.md` Step 1-ter** (신규, 코드/비코드 공통) — 경량 트랙에서도 Intent Gate 베이스라인 3종 존재 검증. 누락 시 `[BLOCKING]` Escalation. Output Contract 에 `Intent Gate 베이스라인` 필드 추가.
+- **`playbooks/harness-audit.md` Phase 2** — `Missing Intent Gate baseline` 단일 복합 HIGH 항목 신설. 3개 하위 요소 (rule / skill / CLAUDE.md section) 중 하나라도 누락 시 HIGH 발행 + 누락 하위 목록 함께 보고. Phase 4 에 자동 패치 특례 추가 (사용자 승인 시 소스 템플릿 그대로 복사, CLAUDE.md 는 백업 후 최상단 prepend).
+- **`playbooks/final-validation.md` Step 3 항목 17** — Intent Gate 베이스라인 3종 존재 검증 (규칙 파일 + 스킬 + CLAUDE.md 섹션). 누락 시 `[BLOCKING]`. Output Contract 필수 섹션에 `## Intent Gate` 추가.
+- **`.claude/rules/orchestrator-protocol.md` Phase Gate 표** — Phase L 진입 조건에 `01-discovery-answers.md` 의 `Intent Gate 베이스라인 설치: yes` 필드 존재 확인 추가. fresh-setup Step 3-F 설치 실패 시 Phase L 진입 전 phase-setup 재소환 유도.
+
+### Changed
+- **`.claude/agents/phase-setup.md`** — Rules 섹션에 "Intent Gate 베이스라인 설치 의무" 조항 추가 (fresh-setup Step 3-F 무조건 수행).
+- **`.claude/agents/phase-setup-lite.md`** — Rules 섹션에 "Intent Gate 베이스라인 검증 의무" 조항 추가 (setup-lite Step 1-ter 수행).
+- **`.claude/agents/harness-auditor.md`** — Rules 섹션에 "Intent Gate 베이스라인 검사 의무" 조항 추가. harness-audit Phase 2 신규 HIGH 항목 + Phase 4 자동 패치 경로로 연결.
+- **`.claude/agents/phase-validate.md`** — Rules 섹션에 "Intent Gate 베이스라인 검증 의무" 조항 추가 (final-validation Step 3 항목 17 수행).
+- **`.claude/templates/common/README.md`** — Intent Gate 베이스라인 (규칙 + 스킬) 을 표에 등재, "무조건 설치" 로 명시. 적용 시점 설명에 Step 3-F 추가.
+
+### Design Notes
+- **규칙·스킬 2층 구조의 근거**: 규칙 파일은 "언제 호출할지" 를 정의하고 스킬은 "어떻게 질문할지" 를 정의한다. 규칙만 있고 스킬이 없으면 호출 대상 부재로 무력화, 스킬만 있고 규칙이 없으면 트리거 장치 없음. **CLAUDE.md 의 "작업 시작 전" 섹션** 은 규칙이 항상적용됨에도 CLAUDE.md 최상단에서 이를 가시화하는 3차 강화 레이어.
+- **메인 세션·대상 프로젝트 스킬 배치의 비대칭**: 이 플러그인 자체는 메인 세션이 `Skill` 도구로 방법론을 직접 호출해 서브에이전트를 우회하는 것을 막기 위해 `playbooks/` 를 쓴다. 반면 대상 프로젝트의 `intent-clarifier` 는 **의도적으로** `.claude/skills/` 에 배치된다 — 대상 프로젝트의 메인 세션이 `Skill` 도구로 직접 호출하는 것이 바로 이 기능의 설계 목적이기 때문. 두 레이어의 설계 목적이 다름을 반영한 정상 패턴.
+- **CLAUDE.md 단일 소유자 원칙의 명시적 예외**: Intent Gate 베이스라인의 audit 자동 패치는 단일 소유자 원칙의 유일한 예외다. 이유: Intent Gate 는 모든 하네스의 최상위 지침이며 기존 본문과 의미적으로 독립된 선행 섹션. 안전장치 3종 (중복 방지 / 위치 고정 / 백업) 으로 본문 파손 위험 제거.
+- **복잡도 게이트 무관 무조건 적용**: 단순 프로젝트·경량 트랙·비코드 프로젝트에서도 Intent Gate 는 설치된다. 의도 확인 필요성은 프로젝트 복잡도와 독립적이며, 예시 사례(v3→v4 포팅)도 단순 프로젝트에서 발생한 문제였다.
+- **Red-team 리뷰 2회 반영**: 플랜 단계 + 실물 구현 단계 각각 `red-team-advisor` 리뷰를 거쳐 등급 일관성·Phase Gate 누락·회차 숫자·단일 소유자 원칙·규칙 충돌 우선순위 BLOCK/ASK 모두 해소.
+
+## [0.9.4] - 2026-04-23
+
+**세팅·감사 플로우에 Claude Code auto-memory (`MEMORY.md`) 인지 레이어 추가**.
+
+Claude Code 의 세션 메모리(`~/.claude/projects/{cwd-encoded}/memory/MEMORY.md`, 사용자 홈 영역·프로젝트별 분리)는 기본 활성화되어 있으나, 하네스 구축 사용자가 존재·위치·수동 시딩 선택지를 인지하지 못하는 맹점이 있었다. 이 변경은 (1) `/harness-architect:harness-setup` 완료 안내에 MEMORY 한 블록을 항상 노출하고, (2) Phase 9 final-validation 보고서의 "다음 단계 안내"에 `/memory` 활용 항목을 추가하며, (3) `/harness-architect:audit` 의 ops-audit 에 Dim G "세션 메모리 인지"를 신설해 read-only 정보성(RISK-LOW 전용)으로 현재 MEMORY.md 상태를 보고한다. **플러그인은 홈 영역에 절대 쓰지 않는다** — 공식 권장 + `ownership-guard` 경계와 일관.
+
+### Added
+- **`commands/harness-setup.md` Phase 9 완료 후 오케스트레이터 출력에 항목 5 (세션 메모리)** 신설 — 경로·`/memory` 커맨드·"비워 두어도 정상"·수동 시딩 선택지·`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` 비활성화 옵션을 1개 블록으로 전달. 조건부 출력 규칙에 "항목 5 는 항상 포함" 명시 (메타-누출 가드 상 대상 프로젝트 CLAUDE.md 본문에는 넣지 않고 오케스트레이터 안내 텍스트로만).
+- **`playbooks/final-validation.md` Step 8 다음 단계 안내에 항목 4** 추가 — `/memory` 슬래시 커맨드 안내 + 경로 + "비워 두어도 자연 축적" 문구. Phase 9 산출물 `07-validation-report.md` 의 `## Next Steps` 에도 동일 흐름으로 반영.
+- **`playbooks/ops-audit.md` Dim G "세션 메모리 인지 (auto-memory)"** 신설 — 대상 프로젝트 `basename` 기반 `~/.claude/projects/*` 후보 디렉터리 유추 후 `memory/MEMORY.md` 존재·크기·비어있음 여부를 read-only 로 확인. 3개 RISK-LOW 정보성 판정 (미존재 / 존재-비어있음 / 존재-N항목). MED/HIGH 승격 구조적 금지. 메타-누출 가드: 권고 문구는 진입점(`/memory`) + 경로 + "비워 두어도 정상" 까지만 허용.
+- **`playbooks/ops-audit.md` Step 2** 를 "6개 Dimension" → "7개 Dimension" 으로 갱신, Dim G 가 홈 영역 read-only 조회만 수행하며 RISK-LOW 만 발행한다는 경계 명시.
+
+### Changed
+- **`.claude/agents/ops-auditor.md` description·Playbooks 섹션** 을 7개 Dimension 으로 갱신하고 Dim G 축 명명 추가.
+- **`commands/audit.md` ops-auditor 병렬 소환 프롬프트** 의 `[Scope]` 를 "6개 Dimension 수행" → "7개 Dimension 수행" 으로 갱신. severity 매핑표·통합 버킷 계산은 기존 그대로 (Dim G 결과는 RISK-LOW → Low 버킷에 자동 편입).
+- **`commands/ops-audit.md` 개별 단독 실행 경로** 의 Scope 문구를 7개 Dimension (A~G) 로 갱신. whitelist 에서 제외된 커맨드지만 자연어 단독 소환 경로에서 참조되므로 동기화.
+
+### Design Notes
+- **플러그인은 MEMORY.md 를 쓰지 않는다** — 공식 문서가 권장하는 경계이며 `ownership-guard.sh` 가 대상 프로젝트 루트 밖 쓰기를 이미 차단. Dim G 는 read-only `uname`/`test -d`/`test -f`/`wc -c`/`grep -c` 만 사용.
+- **OS 중립 설계 (POSIX best-effort + 비POSIX 폴백)** — Claude Code 의 encoded cwd 규칙은 공식 문서상 Linux/macOS/WSL(`절대 경로의 '/' → '-'` 치환)만 명시되어 있고 Windows Native(cmd/PowerShell)는 명시 부재. Dim G 는 `uname -s` 로 환경을 감지해 `Linux`/`Darwin` 에서만 경로 유추를 시도하고, 그 외 환경이나 encoded 디렉터리 부재 시 **추측하지 않고** `/memory` 슬래시 커맨드 안내로 귀결한다. 오케스트레이터 안내 텍스트(`harness-setup.md` 항목 5)와 final-validation 보고서 항목 4는 순수 텍스트로 OS 무관.
+- **모든 채널이 `/memory` 슬래시 커맨드로 수렴** — 공식 OS 중립 진입점은 `/memory` 하나이므로, 세 채널(오케스트레이터 안내 / final-validation 다음 단계 / ops-audit Dim G) 모두 최종적으로 이 커맨드로 사용자를 유도한다.
+- **메타-누출 가드** — Claude Code auto-memory 의 내부 설정키·파일 포맷·컴팩션 동작은 생성 파일·감사 문구에서 설명하지 않는다. 진입점(`/memory`) + 경로 위치 + 수동 시딩 가능/비워 두어도 정상 안내까지만.
+- **대상 프로젝트 CLAUDE.md 에 MEMORY 섹션을 추가하지 않는다** — `meta-leakage-guard.md` 규정상 Claude Code 아키텍처 설명은 대상 프로젝트 산출물에 포함 불가. MEMORY 안내는 오케스트레이터 최종 텍스트 + ops-audit 보고서 텍스트 두 채널로만 노출.
+- **감사 불가 프로젝트(AUDIT-NOT-VIABLE)** 에서는 Dim G 도 실행되지 않는다 — `commands/audit.md` Pre-flight User Work Signal Gate 에서 이미 차단.
+
+## [0.9.3] - 2026-04-23
+
+**`/harness-architect:audit` 에 User Work Signal Gate 도입 — 감사 불가 판정으로 setup 직후 false-positive 차단**.
+
+`frontend-forge` 같은 "하네스는 구축됐으나 실제 프로젝트 작업이 시작되지 않은" 상태에서 `/harness-architect:audit` 를 실행하면 fit-audit Dim 3(에이전트 오버피팅)·Dim 4(사용자 디렉터리 미존재) 등이 **구조적 필연**으로 MAJOR-DRIFT / MINOR-DRIFT 를 발행해 사용자에게 "과잉 탐지 도구"로 학습되는 현상이 관찰됐다. 이 릴리즈는 감사 진입문에 **이진(binary) gate 단 하나**를 추가해, 감사할 "사용자 작업"이 전무하면 3 auditor 를 소환하지 않고 `AUDIT-NOT-VIABLE` 보고서만 출력하고 종료한다. 임계치·경과일·아키타입 분기 없이 단일 `find` 명령으로 판정하며, auditor 플레이북·에이전트 정의는 **일절 수정되지 않는다** (사이드 이펙트 zero).
+
+### Added
+- **`commands/audit.md` Pre-flight 에 Step 4 "User Work Signal Gate" 신설** — 하네스 영역(`.claude/`·`docs/`), IDE 설정(`.cursor/`·`.vscode/`·`.idea/`), VCS(`.git/`), 빌드 아티팩트(`node_modules/`·`.venv/`·`venv/`·`dist/`·`build/`·`.next/`·`target/`·`__pycache__/`·`.pytest_cache/`·`.mypy_cache/`), 보일러플레이트(`README*`·`LICENSE*`·`.gitignore`·`.editorconfig`·`.gitattributes`·`.gitmodules`·`.DS_Store`·`Thumbs.db`), 주요 락파일(`package-lock.json`·`yarn.lock`·`pnpm-lock.yaml`·`uv.lock`·`Cargo.lock`·`go.sum`·`poetry.lock`·`Pipfile.lock`) 을 제외한 **비어있지 않은 파일이 0개** 이면 gate fail. Bash one-liner 는 경로 변수화(`TARGET="..."` + `"$TARGET"` 인용) 로 공백·한글 경로 안전.
+- **AUDIT-NOT-VIABLE 보고서 템플릿** — gate fail 시 오케스트레이터가 직접 출력하는 Markdown 보고서. 판정 사유·감사 미수행 이유·다음 단계(첫 사용자 파일 작성 후 재실행, 또는 개별 auditor 자연어 소환으로 강제 우회)·gate 판정 조건·유사 경고(`heuristic-only-mode`) 와의 차이를 포함. 파일 쓰기 없음, 기존 하네스 무변경.
+- **`오케스트레이터 역할` 섹션에 gate 수행 단계 1줄 추가** — Pre-flight 이후 User Work Signal Gate 판정 → 빈 결과 시 NOT-VIABLE 종료 → 존재 시 기존 3 auditor 병렬 소환 플로우 진입의 분기 명시.
+
+### Changed
+- **탈출구 단순화** — `--force` 같은 별도 플래그를 도입하지 않음. gate 통과 조건(사용자 파일 1개 이상 존재) 과 탈출 방법이 자기-설명적으로 일치. 하네스 설계 자체 의심 시 개별 auditor 에이전트 자연어 소환으로 gate 우회 가능.
+
+### Design Notes
+- **사이드 이펙트 zero** — 이 릴리즈는 `commands/audit.md` 와 `.claude-plugin/plugin.json`, `CHANGELOG.md` 3파일만 수정. `playbooks/harness-audit.md`·`playbooks/ops-audit.md`·`playbooks/fit-audit.md` 및 `.claude/agents/*-auditor.md` 는 무변경. gate 통과 이후의 감사 동작·보고서 포맷·severity 매핑은 기존과 완전히 동일.
+- **Phase 9 `[ASK]` 승계는 별도 과제로 분리** — 사용자 의도가 gate 단일 기능에 집중되었고, `[ASK]` 승계는 auditor 프롬프트 수정을 수반하여 side-effect zero 원칙과 충돌. 후속 릴리즈 대상.
+
+## [0.9.2] - 2026-04-23
+
+**UX 단순화 — 슬래시커맨드 autocomplete 3개 whitelist + audit→harness-setup 적용 플로우 명시**.
+
+사용자 혼란 감소를 위해 `/` 입력 시 노출되는 슬래시커맨드를 `harness-setup`·`audit`·`help` **3개로 제한**. 나머지(`harness-audit`·`ops-audit`·`fit-audit`·`update`) 의 커맨드 파일과 auditor 에이전트는 그대로 유지되어 기능 손실 없음. `/harness-architect:audit` 감사 완료 후 사용자가 개선을 실제 적용하려면 `/harness-architect:harness-setup <대상 경로>` 를 재실행해야 한다는 공식 플로우를 보고서 말미와 `help.md` 에 명시.
+
+### Changed
+- **`.claude-plugin/plugin.json` `commands` 필드를 whitelist 배열로 전환** — 기존 `"./commands/"` (디렉터리 스캔, 7개 모두 노출) → `["./commands/harness-setup.md", "./commands/audit.md", "./commands/help.md"]` (3개만 autocomplete 노출). 나머지 4개 파일(`harness-audit.md`·`ops-audit.md`·`fit-audit.md`·`update.md`) 은 디스크에 보존되나 슬래시커맨드로 호출 불가. Breaking change 최소화를 위해 개별 auditor(`harness-auditor`·`ops-auditor`·`fit-auditor`) 는 `/harness-architect:audit` 통합 커맨드에서 계속 병렬 호출되며, 단일 축 실행이 필요하면 자연어로 해당 auditor 에이전트를 직접 소환하는 경로 제공.
+- **`commands/audit.md` 확장** — (1) frontmatter description 에 "3개 auditor 중 유일한 슬래시 엔트리" 명시. (2) Pre-flight 안내에 "보고서 말미 '🛠 다음 실행 방법' 가이드 참조" 포함. (3) **신규 `## 🛠 다음 실행 방법 (How to apply)` 섹션** 추가 — 3개 경로(`/harness-architect:harness-setup` 재실행 / 수동 편집 / 재감사 검증) 각각의 사용 기준·명령 예시·재개 매커니즘 설명. (4) Recommendation 섹션의 Critical/High/Medium/Aligned 매핑에 `<대상 경로>` 파라미터와 "기존 작업 폴더 감지 시 '계속' 선택" 안내 보강. (5) 부분 실패 처리·축약 규칙·개별 auditor 안내의 "개별 슬래시커맨드 직접 호출" 문구를 "auditor 에이전트 자연어 소환" 문구로 전환. (6) 오케스트레이터 역할 섹션에 "보고서 말미에 How to apply 섹션 항상 포함" 명시.
+- **`commands/help.md` 재구성** — (1) 주요 커맨드 표를 3개(`harness-setup`·`audit`·`help`) 로 축소, `update` 제거. (2) 기존 "🔧 개별 감사 커맨드 (고급 사용자)" 섹션 삭제. (3) **신규 "🧭 두 가지 사용 시나리오" 섹션** 추가 — 시나리오 A(신규 설치) 와 시나리오 B(감사→개선 적용→재감사 검증) 를 단계별 명령 블록으로 제시. (4) 문제 해결·특징 섹션의 개별 커맨드 참조를 통합 플로우로 수정. (5) 정적 출력 규약 강화 — "help 커맨드는 어떠한 경우에도 본문의 명령을 자동 실행하지 않고 사용자에게 별도 호출하도록 유도만 함" 을 문서 상단에 명시.
+- **`.claude/agents/{harness,ops,fit}-auditor.md` description 정리** — 기존 "`/harness-architect:{축}-audit` 커맨드 및 `/harness-architect:audit` 통합 감사에서 호출" 을 "`/harness-architect:audit` 통합 감사에서 병렬 호출되는 3개 auditor 중 하나" 로 변경. whitelist 에서 제거된 개별 슬래시커맨드 참조 제거.
+- **`README.md`·`ARCHITECTURE.md` whitelist 정책 반영** — README 의 "개별 감사" 안내 블록을 "autocomplete 에 없고 auditor 에이전트 자연어 소환으로 단일 축 실행" 으로 교체. ARCHITECTURE 의 Phase 테이블에서 개별 감사 커맨드 라인을 "슬래시커맨드는 whitelist 정책으로 autocomplete 에서 제외" 로 재표기. 레포 구조 트리에서 `commands/` 주석을 "7 files on disk, 3 exposed in autocomplete (whitelist via plugin.json, v0.9.2~)" 로 갱신하고 각 파일에 노출/숨김 주석 부기.
+
+## [0.9.1] - 2026-04-23
+
+### Added
+- **신규 커맨드 `/harness-architect:update`** (`commands/update.md`) — 설치된 버전과 GitHub 최신 릴리즈를 비교해 변경사항(릴리즈 노트)과 함께 업데이트 안내. 업데이트가 있을 경우 check-update 캐시를 자동 삭제하여 다음 세션 배너에 즉시 반영.
+- **`commands/help.md` 커맨드 테이블에 `/harness-architect:update` 항목 추가**
+
+### Fixed
+- **tmux 환경에서 세션 시작 시 업데이트 배너가 보이지 않던 문제 수정** (`scripts/check-update.sh`) — Claude Code 훅은 controlling terminal 없이 실행되어 `stderr.isatty()=False`, 결과적으로 stderr가 Claude 컨텍스트(system-reminder)로만 전달되어 사용자 터미널에 미출력. `$TMUX` 감지 시 `tmux display-message -d 5000`으로 tmux 소켓을 통해 직접 전달(Claude Code 우회). 비-tmux 환경은 `/dev/tty` 직접 출력으로 fallback(실패 시 무음 처리).
+
+## [0.9.0] - 2026-04-23
+
+**UX 재편 + 신규 감사 커맨드 2개** (fit-audit · 통합 audit) + **phantom 해소** (harness-audit 실체화) + **Phase 9 Runtime Spot Check 이식**.
+
+v0.8.x 까지 사용자에게 노출된 기능은 3개 슬래시 커맨드(`harness-setup`·`ops-audit`·`help`) + phantom 참조만 되던 `/harness-architect:harness-audit` (파일 없이 5개 문서가 언급) 구조였다. 이번 릴리즈는 사용자 관점에서 **두 시나리오** 로 UX 를 정리한다:
+
+1. **시나리오 A — 완전 신규 설치**: `/harness-architect:harness-setup` 한 번으로 자기완결. Phase 9 final-validation 에 `ops-audit` Dim B(실패 복구 섹션 스팟) + Dim F(메인 세션 Skill 직접 호출 위험 탐지) 핵심 체크를 이식하여 빌드 직후 운영 중 치명 구조를 차단.
+2. **시나리오 B — 기존 하네스 점검**: 신규 `/harness-architect:audit` 한 번으로 3개 auditor 병렬 실행 + 단일 통합 보고서. 특정 축만 단독으로 보고 싶은 고급 사용자는 `/harness-architect:harness-audit`·`ops-audit`·`fit-audit` 을 직접 호출 가능.
+
+기본 노출 커맨드는 `harness-setup` + `audit` + `help` 3개로 단순화하고, 개별 감사 커맨드 3개는 `help.md` 의 "🔧 개별 감사 커맨드 (고급 사용자)" 섹션으로 계층화. 파일은 보존되어 Breaking change 없음.
+
+### Added
+- **신규 통합 커맨드 `/harness-architect:audit`** (`commands/audit.md`) — 기존 환경 감사의 단일 엔트리. Pre-flight 통과 후 `harness-auditor` + `ops-auditor` + `fit-auditor` 3개 에이전트를 **한 응답에 병렬 소환**. 반환 수신 후 severity 3체계(CRITICAL/HIGH/MEDIUM/LOW ↔ RISK-H/M/L ↔ MAJOR-DRIFT-CRITICAL/MAJOR-DRIFT-MED/MINOR-DRIFT/ALIGN)를 통합 버킷(Critical/High/Medium/Low/Aligned)으로 매핑해 단일 Markdown 보고서로 조립. **동일 항목 식별 알고리즘** 명시 (W4: `(파일경로)` 키, W16: `(정렬된 파일쌍)` 키, 기타 Jaccard ≥70% + 공통 파일 경로). SSoT 공유 항목 충돌 시 ops-audit 판정 우선, 비-SSoT 중복은 높은 등급 채택. **원본 등급 병기 원칙** (`[ops / RISK-HIGH → Critical]` 형식), **부분 실패 처리** (일부 auditor 실패 시 나머지로 부분 조립 + 실패 섹션 명시, 3개 전부 실패 시 중단), **보고서 크기 상한 300 라인** (초과 시 Medium/Low 축약 자동 적용), **heuristic-only-mode 조건부 경고** (Critical 유보 안내) 등 운영 규약 포함. 대규모 하네스에서는 개별 커맨드 순차 실행 권장 안내 포함.
+- **신규 커맨드 `/harness-architect:harness-audit`** (`commands/harness-audit.md`) — phantom 해소. v0.8.x 까지 5개 문서(`commands/ops-audit.md`·`commands/fit-audit.md`·`playbooks/final-validation.md`·`playbooks/fit-audit.md`·`playbooks/fresh-setup.md`)가 참조했지만 실제 파일은 존재하지 않던 커맨드를 실체화. 독립 실행형 구성 정합성 진단. `harness-auditor` 에이전트 소환 후 CRITICAL/HIGH/MEDIUM/LOW 4등급 보고.
+- **신규 에이전트 `harness-auditor`** (`.claude/agents/harness-auditor.md`) — Sonnet 기반 read-only 리뷰어. 기존 `playbooks/harness-audit.md` Phase 1-3(Full 4-Scope Scan → Anti-Pattern Detection → Diagnostic Report) 만 수행하고 Phase 4-5(User Decision → Execute Remediation) 는 오케스트레이터에 위임. 기존 `ops-auditor`·`fit-auditor` 와 차별화되는 근본 질문("파일 구조가 올바른가") 및 SSoT 공유 항목의 ops-audit 우선 규약 문서화. `plugin.json` `agents` 배열에 등록.
+- **신규 커맨드 `/harness-architect:fit-audit`** (`commands/fit-audit.md`) — 독립 실행 감사 커맨드. Pre-flight 진입 즉시 "이 커맨드는 진단 전용" 안내 후 `$ARGUMENTS` 경로 수집, 하네스 최소 존재 검증, `docs/*/01-discovery-answers.md` 존재 여부에 따라 `baseline-mode` / `heuristic-only-mode` 분기. 결과는 `MAJOR-DRIFT-CRITICAL / MAJOR-DRIFT-MED / MINOR-DRIFT / ALIGN` 4등급 + (발견 시) `Security Warning` 별도 섹션으로 보고.
+- **신규 에이전트 `fit-auditor`** (`.claude/agents/fit-auditor.md`) — Sonnet 기반 read-only 리뷰어. 하네스 파일·baseline 산출물·프로젝트 소스 트리(파일 수·경로·구조 신호만)·MCP 선언·훅 스크립트 정적 분석 수행. 소스 파일 본문 미조회, 네트워크 호출 없음, 훅 실행 없음 — 비용·프라이버시·flakiness·부작용 방지. `plugin.json` `agents` 배열에 등록.
+- **`playbooks/final-validation.md` Step 7 Runtime Spot Check 신설** — 시나리오 A 자기완결 게이트. 4개 하위 체크: 7-A Failure Recovery 섹션 존재 확인(헤더 + 본문 2줄 이상), 7-B 개방형 루프 금지 문구(`재설계 요청`·`다시 검증`·`Builder에게 넘김` 등) 탐지, 7-C 메인 세션 Skill 직접 호출 위험 패턴 grep(범위: `commands/`·`playbooks/`·`.claude/agents/`·`CLAUDE.md` 4개 확장), 7-D docs 체인 frontmatter 4개 필드 무결성. 기존 Step 7/8 은 Step 8/9 로 번호 이동. 필수 산출물 섹션에 `## Runtime Spot Check` 추가. 내용 완결성 심층 검증은 여전히 `ops-auditor` Dim B 담당이라는 범위 한계 명시.
+- **`playbooks/fit-audit.md` MAJOR-DRIFT 서브등급 판정 섹션** — 통합 audit 보고서의 Critical/Medium 버킷 매핑을 위해 MAJOR-DRIFT 를 `MAJOR-DRIFT-CRITICAL` (운영 방해·오도: 주요 활동 영역 미커버·허용 경로 절반 이상 stale·도메인 오도·훅 실행 불가·MCP 완전 부재) 과 `MAJOR-DRIFT-MED` (재구축 권장이나 운영 가능) 로 서브분류. heuristic-only-mode 는 CRITICAL 승격 불가 규약 포함.
+- **신규 플레이북 `playbooks/fit-audit.md`** — 7 Dimension 정의:
+  - Dim 1 트랙 드리프트 — baseline `track` 값 vs 현재 기준 재평가(경량 트랙 9조건)
+  - Dim 2 아키타입/품질축 미스핏 — `fresh-setup.md` Step 3-A~E 신호 현재 코드에 재실행 후 하네스 실제 채택과 대조
+  - Dim 3 에이전트 규모 미스핏 — `.claude/agents/*.md` 수·모델 티어 vs 소스 규모·워크플로우 복잡도 (Opus 오버피팅, Haiku 언더피팅 탐지)
+  - Dim 4 권한 경로 드리프트 **+ Security Warning** — `settings.json permissions.allow` + agent `allowed_dirs` 실존 검증, 모노레포 이관 감지. 추가 절차로 위험 allow 와일드카드(`Bash(*)`·`Bash(sudo *)` 등), 필수 deny 누락, 실제 비밀값 패턴(`sk-`·`ghp_`·`AKIA`·`Bearer` 등) 을 감지해 **드리프트 등급과 독립된 Security Warning 섹션**으로 보고. 실제/더미 구분 후 즉시 `harness-audit`/`ops-audit` 실행 권장.
+  - Dim 5 CLAUDE.md·**도메인 정체성 드리프트** — 선언 스택·팀 크기·프로젝트 유형·**도메인 키워드**(리서치·대시보드·커머스·MLOps 등) grep + `docs/*/02b-domain-research.md` 도메인 ID 추출 후 현재 파일 증거(디렉터리 명명·매니페스트) 와 교차. 리서치→웹앱 피봇 같은 도메인 드리프트 감지.
+  - Dim 6 Baseline 부재 처리 — heuristic-only-mode 전용, 모든 판정에 "(추정)" 접미사 의무
+  - **Dim 7 외부 인터페이스 드리프트 (MCP & Hook Drift)** — 하네스의 **활성 런타임 표면**을 정적 검증:
+    - 7-A MCP 서버 드리프트: `settings.json`/`settings.local.json` `mcpServers` 각 항목에 대해 command 기반(`which`), url 기반(형식 유효성), env 참조(`.env.*` 선언 확인) 정적 검증
+    - 7-B 훅 실행 가능성 드리프트: `.claude/hooks/*.sh` 의 경로 참조 유효성·외부 도구 의존성(`jq`·`python3`·`curl` 등)·실행 권한(`test -x`), `matcher` 관련성 점검
+    - 7-C 훅 누락 (역방향): 프로젝트 신호(`.env.*` 존재·force-push 권한·멀티 에이전트) 에 비해 필수 보안 훅이 `hooks.json` 에 누락됐는지 감지
+
+### Changed
+- **`.claude-plugin/plugin.json` `version` 범프** — `0.8.3` → `0.9.0` (신규 커맨드 도입 = minor bump, SemVer 준수).
+- **`plugin.json` `agents` 배열** — `fit-auditor`, `harness-auditor` 2개 항목 말미에 추가 (12개 → 14개).
+- **`commands/help.md` UX 계층화** — 기존 "📋 제공 슬래시 커맨드" 표를 **"📋 주요 커맨드 (대부분 여기서 끝남)"** (harness-setup + audit + help) 와 **"🔧 개별 감사 커맨드 (고급 사용자)"** (harness-audit + ops-audit + fit-audit) 두 섹션으로 분할. 시나리오 A/B 설명 블록 추가. "기존 하네스 점검" 안내를 `ops-audit` → `audit` (통합) 로 갱신.
+- **`commands/ops-audit.md` / `commands/fit-audit.md` 상단에 "`/harness-architect:audit` 권장" 안내 배너** — 개별 커맨드 자체 독립 실행 경로는 유지하되 대부분의 사용자가 통합 엔트리로 유도되도록 안내.
+- **`playbooks/final-validation.md` Step 8 최종 보고서 다음 단계 안내** — 기존 "/harness-audit 로 정기 점검" 을 "`/harness-architect:audit` 로 통합 감사. 특정 축만 보려면 개별 커맨드 직접 호출" 로 갱신.
+
+### Rationale
+- **UX 재편 근본 동기**: v0.8.x 까지 사용자에게 4개 기능이 노출되어 혼란(`harness-setup`·`ops-audit`·`help` + phantom `harness-audit`). 실제 사용자 관점은 **두 시나리오(신규 설치 / 기존 감사) 뿐**. 주요 노출을 `harness-setup` + `audit` 2개로 좁혀 시나리오-커맨드 1:1 매핑 달성. 개별 감사 커맨드는 고급 사용자용으로 보존해 Breaking 없이 단순화.
+- **왜 안 3(타협) 인가**: 안 1(기존 4개 + 신규 1 = 5개 노출) 은 오히려 복잡도 증가. 안 2(2개로 축소 + Breaking) 는 기존 문서·튜토리얼·북마크 무효화. 안 3 은 노출 계층화로 두 장점 결합.
+- **phantom 해소 불가피**: `/harness-architect:harness-audit` 은 5개 문서에서 "즉시 실행 강권" / "권장 순서" / "정기 점검" 목적으로 참조됐으나 파일이 없어 실행 시 실패했다. 통합 `audit` 만 추가해서는 이 참조들이 여전히 유효하지 않다. `harness-auditor` 에이전트 + `commands/harness-audit.md` 를 신설하여 참조 전체를 실체화.
+- **시나리오 A 완결성 — Phase 9 Runtime Spot Check**: `ops-audit` Dim D(덮어쓰기)·Dim E(Jaccard) 는 Phase 9 가 이미 SSoT 로 공유 커버. 미커버 영역은 Dim B(실패 복구)·Dim F(라우팅). `fit-audit` 은 빌드 직후 드리프트가 구조적으로 0 → 편입 무의미. 이식 범위는 스팟 체크 수준으로 제한(완결성 심층 검증은 여전히 `ops-auditor` 담당) — Phase 9 비대화 방지.
+- **9-A Pass 조건 "헤더 + 본문 2줄 이상"**: "헤더만 있으면 통과"(가장 약함) 는 placeholder 섹션 false negative 위험. "헤더 + `max_retries` 키워드 필수"(가장 강함) 는 자연어 표현("세 번 시도 후 포기") false positive 위험. "2줄 이상" 은 빈 껍데기만 거르는 균형점. 완결성은 `ops-auditor` 에 위임.
+- **9-C 범위 4개 파일군 확장**: Skill 직접 호출 위험은 `commands/*.md` 뿐 아니라 오케스트레이터 에이전트 정의·하네스 CLAUDE.md 본문에도 삽입 가능. `playbooks/`·`.claude/agents/`·`CLAUDE.md` 추가로 false negative 최소화.
+- **MAJOR-DRIFT 서브등급**: 통합 audit 보고서의 Critical 버킷은 "즉시 조치" 이고 Medium 버킷은 "개선 권장" 이나, `fit-audit` 의 MAJOR-DRIFT 는 두 의미가 섞여 있어 단일 매핑 시 오분류 위험. fit-auditor 가 `MAJOR-DRIFT-CRITICAL`(운영 방해·오도) / `MAJOR-DRIFT-MED`(재구축 권장이나 운영 가능) 로 **발행 시점에 서브분류**하여 해결. heuristic-only-mode 는 근거 약하므로 CRITICAL 승격 불가.
+- **SSoT 충돌 `ops-audit` 우선 규약 명시**: W4(산출물 절대경로)·W16(Jaccard 중복) 은 harness-audit 과 ops-audit 에서 이중 검사. `commands/ops-audit.md` 에 이미 "판정 충돌 시 ops-audit 우선(더 최신 상태 반영)" 규약이 존재. `commands/audit.md` 통합 보고서 조립에 이를 상속해 명시 — 중복 판정으로 사용자 혼란 방지.
+- **병렬 Agent 3개 소환의 컨텍스트 비용**: 대규모 하네스에서 각 auditor 보고서가 수십 KB 에 이르면 메인 세션 합산 비용이 상당하다. 실패 요인은 아니지만 `commands/audit.md` 에 "대규모 하네스에서는 개별 커맨드 순차 실행 권장" 명시.
+- **ops-audit 와 의미 영역 무중첩**: ops-audit Dim A~F 는 하네스 파일 텍스트만 감사(세션 복구·retry·이중관리·덮어쓰기·Jaccard·라우팅). fit-audit Dim 1~7 은 하네스 vs 실제 프로젝트 상태·외부 인터페이스 비교 — 데이터 소스·오탐 패턴·근본 질문이 달라 단일 RISK 체계로 혼합 시 판정 혼동 유발. 독립 커맨드로 분리.
+- **Security Warning 을 드리프트 등급과 분리한 이유**: 드리프트는 "하네스와 프로젝트 현재의 괴리 크기" 이고 Security 는 "즉시 조치 필요한 위험" — 의사결정 흐름이 다름. Security Warning 을 MAJOR-DRIFT 로 승격 시 "재구축하면 해결" 이라는 오해 유발. 별도 버킷으로 분리해 `harness-audit`/`ops-audit` 즉시 실행을 권장.
+- **도메인 드리프트를 Dim 5 에 통합한 이유**: Dim 5 의 "CLAUDE.md 선언 vs 현재 파일 증거" 로직과 95% 겹침. 키워드·파일 참조 확장만으로 커버 — 별도 Dim 신설 비용 없음.
+- **Dim 7 정적 검증만 원칙**: 네트워크 호출(MCP URL ping) 기각 — 권한·비용·flakiness 유발. 훅 스크립트 실행 기각 — 부작용·환경 차이·권한 이슈. 정적 grep 으로 PATH 부재·env 누락·실행 권한 같은 확정 실패는 감지 가능 + Coverage Gaps 에 "실제 응답성·런타임 동작은 실 세션에서만 검증" 명시.
+- **소스 본문 미조회 원칙**: 구조 신호(파일 수·경로·매니페스트·CI·compose·디렉터리 깊이)만으로 적합성 감사가 충분. 본문 스캔은 대형 레포에서 토큰 수십만 단위 증가 + 프라이버시 리스크 + 커밋 변동에 따라 감사 결과 flaky — 의도적 범위 밖.
+
+### Breaking
+- 없음. 기존 노출 커맨드(`harness-setup`·`ops-audit`·`help`) 동작 불변, 기존 하네스·생성 산출물 무관. 주요 노출이 `harness-setup` + `audit` 2개로 좁혀졌으나 `ops-audit`·`fit-audit`·`harness-audit`(신규 실체) 는 개별 커맨드로 모두 사용 가능.
+
+## [0.8.3] - 2026-04-22
+
+업데이트 알림 배너를 **사용자 터미널에 실제로 표시**하도록 수정. v0.7.1 도입 이후 v0.8.2 까지의 모든 알림 훅이 구조적으로 잘못 동작하던 치명적 결함 해결 — Claude Code 의 SessionStart 훅은 stdout 을 **어시스턴트 컨텍스트(`additionalContext`)로만** 주입하며 사용자 터미널에는 표시하지 않는다는 [공식 문서](https://code.claude.com/docs/en/hooks.md) 규약을 이번에야 반영. 실제로는 Claude 만 업데이트 정보를 알고 사용자는 한 번도 배너를 본 적 없던 상태. 사용자 피드백("GSD 같이 버전 알림이 있으면 좋겠다")을 계기로 `update-notifier` npm 패키지 패턴에 맞춰 재설계.
+
+### Fixed
+- **`scripts/check-update.sh` 이중 출력 스트림 분리** — stdout 은 Claude 어시스턴트용 평문 알림(기존 호환), stderr 는 사용자 터미널용 컬러 배너(신설). stderr 는 SessionStart 훅 exit code 와 무관하게 터미널에 표시되므로 사용자가 세션을 열 때마다 즉시 눈으로 확인 가능.
+- **외부 `2>/dev/null` 래퍼 제거** — 기존 래퍼가 의도치 않게 새 stderr 배너까지 삼키던 문제 해결. 에러 억제는 python 스크립트 내부의 `try/except Exception: sys.exit(0)` 으로 이동하여 어떤 실패 시나리오(파일 없음·import 실패·argv 누락 등)에서도 사용자 흐름을 방해하지 않도록 유지.
+
+### Changed
+- **배너 스타일** — `update-notifier` 스타일 단일 라인 컬러 배너. cyan 이름 + dim 구버전 + green 신버전 + yellow 커맨드. `NO_COLOR` 환경변수 존중 및 `sys.stderr.isatty()` 체크로 파이프/리다이렉션 환경에서는 ANSI 이스케이프 코드 자동 제거.
+
+### Rationale
+- **왜 stderr 인가**: Claude Code 공식 hooks 문서에 따라 SessionStart stdout 은 `hookSpecificOutput.additionalContext` 로 파싱되어 Claude 에게만 전달되고, 사용자 UI 렌더링에는 참여하지 않는다. stderr 는 이 계약에서 제외된 스트림이므로 터미널 에뮬레이터가 그대로 렌더. 같은 이유로 Claude Code 의 다른 hook 이벤트(PreToolUse 등) 에서도 stderr 는 사용자 피드백 채널로 쓰인다.
+- **왜 Claude 컨텍스트도 유지하는가**: 사용자가 "업데이트 알림이 떴네"라고 말했을 때 Claude 가 맥락을 알고 있어야 `/plugin update` 실행을 안내할 수 있다. stdout 만 삭제하면 Claude 가 "무슨 업데이트?"로 되물을 수 있음. 중복이 아니라 양쪽 대상에 각자 포맷으로 전달.
+- **왜 v0.7.1~v0.8.2 는 눈에 띄지 않았는가**: 개발자 로컬에서 `bash scripts/check-update.sh` 로 직접 실행하면 셸이 stdout 을 터미널로 그대로 쏘기 때문에 "배너가 잘 출력된다" 고 오인하기 쉽다. 실제 Claude Code 세션의 SessionStart 훅 경로에서는 stdout 이 파싱되어 소비되므로 사용자는 아무것도 못 봄. 이 구분을 검증 단계에서 놓친 회귀.
+
+### Breaking
+- 없음. 하네스 산출물 무관. 알림 출력 채널만 stdout → stdout+stderr 로 확장.
+
+## [0.8.2] - 2026-04-22
+
+업데이트 알림 훅 `scripts/check-update.sh` 의 캐시 검증 강화. 기존 구현은 캐시 파일 첫 줄을 버전 문자열로 간주하고 그대로 사용했는데, v0.7.2 이전 버전에서 **배너 문자열 전체**를 캐시에 저장한 사용자 환경이 남아 있으면 현재 훅이 캐시값을 정규식에 매칭 실패시켜 `LATEST=""` 로 조용히 종료 → 업데이트 배너가 영구적으로 미출력되는 문제가 있었다. v0.1.0 같은 초기 버전 사용자도 포함해 모든 구버전 설치 환경이 영향 범위.
+
+### Fixed
+- **`scripts/check-update.sh` 캐시 검증 로직 추가** — `is_valid_version()` 헬퍼를 도입해 캐시 내용이 `^[0-9]+\.[0-9]+\.[0-9]+` 형태인지 엄격 검증. 24h 신선 캐시 로드 경로와 API 실패 fallback 경로 **둘 다**에서 검증하여, 손상된 캐시(구버전이 남긴 배너 문자열 등)를 감지 시 삭제하고 재조회를 유도. 첫 SessionStart 에 자가 치유 완료.
+
+### Rationale
+- **왜 캐시 삭제 + 재조회가 필요한가**: v0.7.2(`b38c17a`)에서 "배너 문자열 저장 → 버전 문자열만 저장"으로 포맷을 변경했으나 기존 캐시 파일에 대한 마이그레이션 경로가 없었다. 결과적으로 v0.7.1 이하 사용자가 업데이트한 뒤에도 구 포맷 캐시가 24h 동안 계속 로드되어 배너가 안 뜨는 상태가 지속. 이번 수정으로 캐시 포맷 불일치를 자가 감지해 복구한다.
+- **왜 v0.1.0 사용자에게도 확실히 전달되는가**: 가짜 `plugin.json` + 손상 캐시 조합으로 재현 검증 완료 — 캐시가 폐기되고 GitHub API 가 재조회된 뒤 `⬆ harness-architect v0.8.2 출시됨 (현재: v0.1.0) ...` 배너가 정상 출력됨을 확인.
+
+### Breaking
+- 없음. 하네스 산출물 무관.
+
+## [0.8.1] - 2026-04-22
+
+Advisor 비용 최적화. 실측 세션(`frontend-forge` 하네스 세팅, $9.17)에서 13% 비용($1.2)이 Phase 3-6 Advisor 의 "Dim 6 보안 BLOCK 조기 발행 → 재작업 루프" 에서 발생한 점을 근거로, **Dim 6 시행 시점 localization** 과 **Haiku security-auditor 분리** 두 가지를 적용. 세션당 ~$1.0 절감 예상. "Dim 6 복잡도 게이트 무관 전체 실행" 원칙과 "비밀값 즉시 BLOCK" 원칙은 유지 — 이번 변경은 경량화가 아닌 **시행 지점 명확화**.
+
+### Added
+- **신규 에이전트 `security-auditor`** (`.claude/agents/security-auditor.md`) — Haiku 기반 Dim 6 패턴 매칭 전용 보조 에이전트. Phase 9 final-validation Step 5 에서 병렬 소환 가능. Read-only, 검사 대상을 대상 프로젝트의 실제 하네스 파일(`settings.json`, `agents/*.md`, `SKILL.md`, `hooks.json`)로 엄격 제한. 판정 애매 시 `[BLOCK]` 금지, `[ASK]` 로 에스컬레이션하여 Haiku false-positive 리스크 방어. `plugin.json` `agents` 배열에 등록.
+- **`playbooks/design-review.md` Dimension 6 재작성** — Phase별 등급 매트릭스 도입. 5열 표(산출물 유형·실제 JSON 패턴·서술적 언급·실제 비밀값·더미 비밀값)로 Phase 3-6/7-8/9 각각의 [BLOCK]/[ASK]/[NOTE] 등급을 명시. "실제 비밀값 vs 더미 플레이스홀더" 판정 기준(난수성+맥락) 추가.
+- **`playbooks/final-validation.md` Step 5 3단계 fallback 구조화** — 5-A(security-auditor 소환, 선택적) → 5-B(수동 체크, 항상 수행) → 5-C(자동 도구). security-auditor 실패 시 5-B 로 자동 fallback. 최소 2개 경로 성공해야 Dim 6 게이트 통과로 인정.
+- **`.claude/rules/orchestrator-protocol.md` Phase 9 security-auditor 병렬 소환 문구** — 소환 템플릿 인라인. Dim 6 localization 원칙(`[NOTE]` 처리 후 Phase 7-8/9 시행) 명시. `phase-validate` 가 Phase 9 완결성에 대한 최종 권위 유지.
+
+### Changed
+- **Red-team Advisor Dim 6 항목 업데이트** (`.claude/agents/red-team-advisor.md`) — "Phase 3-6 설계 마크다운의 서술적 언급은 [NOTE], 실제 JSON 하드 텍스트 위반만 [BLOCK]. 비밀값은 실제 vs 더미 구분하여 각각 [BLOCK]/[ASK]" 로 명시. 이는 "경량화"가 아닌 "시행 시점 localization" 임을 강조.
+- **Red-team Advisor Dim 11 항목에 security-auditor 적합성 노트** 추가 — Haiku 배정이 "단순 검증 역할"로 정당함을 명시하여 Model Confirmation Gate 오탐 방지.
+- **`ARCHITECTURE.md` 에이전트 집계 업데이트** — `.claude/agents/*.md` 집계를 8개에서 **12개**로 갱신(기존 9 phase workers + red-team-advisor + phase-setup-lite + ops-auditor + 신규 security-auditor). Phase 역할 표에 security-auditor 행 추가.
+
+### Security
+- **비밀값 즉시 BLOCK 원칙 불변** — 실제 비밀값(난수성 토큰) 은 Phase 무관 어디서든 즉시 [BLOCK]. 이번 변경은 **더미/플레이스홀더 구분**만 추가 (교육용 예시로 의도된 `<YOUR_API_KEY>` 등은 Phase 3-6 에서 [ASK]). Phase 7-8 실제 파일에는 더미도 [BLOCK].
+- **security-auditor Scope Boundary 엄격** — 어시스턴트 프로젝트(`${CLAUDE_PLUGIN_ROOT}`) · 대상 프로젝트 소스 코드 · `docs/` 설계 문서는 검사 범위 **외**. 플러그인 자체 파일 오검사 방지.
+- **Dim 6 "복잡도 게이트 무관 전체 실행" 원칙 유지** — 매트릭스는 시행 시점 명확화이며, 모든 위반은 최소 1회 [BLOCK] 으로 승격된다 (Phase 3-6 조기 BLOCK 또는 Phase 7-8/9 최종 BLOCK).
+
+### Rationale
+- **왜 Red-team Advisor 전체를 Haiku 로 바꾸지 않았는가**: Red-team Advisor 는 Dim 1~13 중 대다수가 **맥락 추론**(목적-수단 정합성, 암묵적 가정 식별 등) 을 요구. Haiku false-positive 리스크가 크다. 반면 Dim 6 는 grep 수준 패턴 매칭만 필요 → Haiku 로 분리가 자연스러움. `ops-auditor` 가 Sonnet 을 쓰는 이유(운영 부채 맥락 추론) 와 동일 논리.
+- **왜 Phase 3-6 [NOTE] 로 하강하는가**: Phase 3-6 산출물은 **설계 마크다운**이며 실제 `settings.json` 권한 목록은 Phase 7-8 에서 확정된다. 설계 스펙의 "이 에이전트는 쉘 실행 필요" 서술을 [BLOCK] 으로 걸면 **premature reject** — 실제 위반은 Phase 7-8 에서 확실히 판정 가능.
+- **순비용 효과**: BLOCK 루프 감소(세션당 ~$0.8 절감) + Haiku 분리(~$0.2 절감) = ~$1.0. 보수 추정 -$0.5, 낙관 추정 -$0.8 (Phase 7-8 재작업 1회 가정).
+
+### Breaking
+- 없음. 기존 하네스는 영향 없음. Dim 6 매트릭스는 **Advisor 실행 시점의 행동 변경**이며 기존 생성물 재검증 불필요.
+
+## [0.8.0] - 2026-04-22
+
+자동 판별 로직의 구조적 결함 일괄 수정. 기존 시스템은 프론트엔드 프리셋(3-E)·Strict Coding(3-B)·code-researcher(3-D) 판별을 전적으로 **파일 아티팩트** 에만 의존하여, 빈 폴더(greenfield) 프로젝트에서 사용자가 발화로 명시한 의도가 점수 0점으로 묵살되는 맹점이 있었다. 예: 사용자가 "프론트엔드 디자인도 개선" 을 초기 발화에 명시해도 `package.json` 이 없으면 프리셋 자동 주입이 스킵되는 케이스. 이번 릴리즈는 Phase 0 사전 인터뷰에 **구조화된 "품질 축" 멀티셀렉트 질문(A6)** 을 추가하여 판별 입력을 명시적 사용자 답변으로 승격하고, 빈 폴더 greenfield 에서도 사용자 의도가 자동 판별의 공식 입력이 되도록 재설계한다. 경량 트랙 판별 기준도 8→9 로 확장되어 "대규모 마이그레이션/리라이트 의도가 있는 빈 폴더" 가 lightweight 로 오분류되던 역설을 해소한다.
+
+### Added
+- **Phase 0 사전 인터뷰 A6 "품질 축" 멀티셀렉트 질문** (`.claude/rules/orchestrator-protocol.md`) — `프론트엔드 디자인·UX` / `Strict Coding` / `보안·컴플라이언스` / `에이전트 파이프라인` / `해당 없음` 중 복수 선택. 답변은 `phase-setup` 에이전트 프롬프트의 `[User Quality Axes]` 로 전달되어 Step 3-B/3-D/3-E 판별의 공식 입력으로 사용된다. 기존 `[Model Tier]` 패턴과 동일.
+- **`playbooks/fresh-setup.md` Step 1.5 "User-Declared Structure" 섹션 신설** — A1 자유 서술과 초기 발화에서 에이전트 체인·서비스 분할·외부 의존·마이그레이션 동사·규모/팀 힌트를 구조화 추출하여 산출물 `## Context for Next Phase` 에 기록. Phase 3-4 설계가 발화 구조를 누락하는 것을 방지. 추론이 아닌 발화 증거 기반.
+- **트랙 판별 9번째 조건** (`.claude/rules/orchestrator-protocol.md`) — 경량 트랙 AND 조건 8→9 확장. 새 조건: "A6 품질 축 답변 0~1개 (`해당 없음` 포함) AND User-Declared Structure 에 대규모 마이그레이션/리라이트/멀티 서비스(3개 이상)/에이전트 체인 신호 없음". `playbooks/setup-lite.md` Prerequisites 도 9개 조건 목록으로 갱신.
+
+### Changed
+- **Step 3-B Strict Coding 판별에 A6 승격 규칙 추가** (`playbooks/fresh-setup.md`) — `[User Quality Axes]` 에 `Strict Coding` 포함 시 스캔 신호 개수 무관하게 `[ASK]` 즉시 승격. 기존 키워드("엄격/정석/프로덕션") 단독 감지 규칙(신호 #7)은 호환 유지. A6 답변이 키워드 파싱보다 우선.
+- **Step 3-D code-researcher 감지 기준 OR 조건 확장** — 기존 3개 조건(소스 디렉터리/매니페스트/Language 감지)에 두 가지 추가: (1) A6 품질 축 답변에 `Strict Coding`/`프론트엔드 디자인·UX`/`보안·컴플라이언스` 중 하나 이상 포함, (2) User-Declared Structure 에 마이그레이션·리라이트 신호 존재. 빈 폴더 + "GUI→웹앱 포팅" 발화 케이스가 비코드로 오분류되던 문제 해소.
+- **Step 3-E 프론트엔드 프리셋 판별에 A6 우선 규칙 추가** — `[User Quality Axes]` 에 `프론트엔드 디자인·UX` 포함 시 아티팩트 기반 가중치 스코어링을 건너뛰고 `[ASK]` 즉시 승격. 기존 점수 테이블은 A6 에 해당 축이 없는 경우에만 보조로 작동.
+
+### Fixed
+- **Greenfield 의도 무시 버그 (핵심)** — 사용자가 "프론트엔드 디자인도 개선" 같은 명시적 의도를 Phase 0 발화에 포함해도 빈 폴더라서 Frontend Signal Score 가 0점 처리되어 프리셋이 스킵되던 버그. 본 릴리즈로 A6 답변이 아티팩트 점수와 OR 결합되어 구조적으로 해소. 동일 구조의 맹점이 Step 3-B/3-D 에도 존재했으며 동일 원리로 수정.
+- **빈 폴더 greenfield 가 경량 트랙으로 오분류되던 역설** — 기존 8개 트랙 조건이 모두 "파일/디렉터리 부재 기반" 이라 빈 폴더는 자동으로 lightweight 후보가 됐다. "GUI→웹 대규모 마이그레이션 + 디자인 개선" 같은 대규모 작업 의도가 있는 빈 폴더도 단일-패스 lightweight 로 떨어졌다. 9번째 조건(사용자 발화 의도)이 이 역설을 해소.
+
+### Rationale
+키워드·가중치 기반 확장 대안(예: "UI/디자인/프론트엔드" 키워드 +3 가중치 추가)을 검토했으나 세 가지 이유로 기각:
+1. **키워드 화이트리스트는 두더지잡기** — "프론트엔드" 는 잡아도 "화면 개선"·"리뉴얼"·"Figma 기반"·"레이아웃 갈아엎기" 같은 표현은 놓친다.
+2. **가중치 튜닝의 임의성** — +3 vs +2 근거 부족. 판별기마다 별도 튜닝 필요.
+3. **LLM 의 자연어 파싱은 재현성 없음** — 같은 발화도 세션마다 점수가 달라질 수 있음.
+
+대신 Phase 0 에 **구조화된 선택지 질문** 을 한 번 추가하여 사용자 의도를 결정적 입력으로 받는다. 새 품질 축은 옵션 추가만으로 확장 가능하며 키워드 사전 유지보수 부담이 없다.
+
+### Breaking
+- **Phase 0 사전 인터뷰 질문 1개 증가** (A5 → A6). 기존 하네스 세팅 흐름은 동일하게 동작하나, 새 세션에서는 품질 축 질문이 추가로 노출된다.
+- **트랙 판별 기준 8개 → 9개**. 기존 하네스 재생성·재개 시 이전 버전에서 lightweight 로 분류되던 일부 greenfield 프로젝트가 full 트랙으로 승격될 수 있다.
+
+## [0.7.2] - 2026-04-22
+
+v0.7.1 업데이트 체크 훅의 캐시 스테일 버그 픽스. 이전 구현은 "배너 문자열 전체"를 캐시에 저장했는데, 사용자가 `/plugin update` 로 로컬 버전을 갱신해도 24시간 동안은 캐시된 옛 배너가 계속 출력되어 "이미 최신인데 업데이트하라"는 잘못된 알림이 노출됐다. 이번 패치는 캐시에 "최신 버전 문자열"만 저장하고 매 세션마다 로컬 `plugin.json` 과 비교하도록 재설계하여 로컬 업데이트 직후 즉시 정확한 상태를 반영한다.
+
+### Fixed
+- **캐시 스테일 배너 버그** — `scripts/check-update.sh` 재설계. 캐시에 저장하는 내용을 "전체 배너 텍스트"에서 "최신 버전 문자열 (예: `0.7.2`)"로 변경. `CURRENT` 는 매 세션 `plugin.json` 에서 새로 읽고, `LATEST` 는 캐시 또는 API 에서 가져와, 매 세션마다 fresh 비교. 로컬 플러그인 업데이트 후 첫 세션에서 즉시 배너가 사라짐.
+
+### Changed
+- **API 실패 복원력 향상** — 기존에는 API 실패 시 캐시를 덮어쓰지 않거나 비웠는데, 이제는 이전 캐시 내용을 유지하면서 타임스탬프만 갱신. 일시적 네트워크 장애에도 직전까지 알려진 "최신 버전" 정보로 배너를 계속 제공.
+- **캐시 파싱 방어** — `head -n 1 | tr -d '[:space:]'` 로 개행/공백 정리. `re.match(r"^\d+\.\d+\.\d+")` 정규식이 파싱 실패 시 조용히 no-op (손상된 캐시도 크래시 없이 무시).
+
+### Verified
+- 5개 시나리오 스모크 테스트 통과: (1) 구버전+캐시 없음 → 배너, (2) 구버전+캐시 신선 → 배너, (3) **로컬 업데이트 후 스테일 캐시 → 배너 없음 (핵심 픽스)**, (4) 현재==최신 → 배너 없음, (5) 손상 캐시 `asdf` → 조용히 스킵.
+
+## [0.7.1] - 2026-04-22
+
+세션 시작 시 자동 버전 체크 훅 신설. 플러그인 저장소에 새 릴리즈가 올라오면 Claude Code 세션이 열릴 때 `⬆ harness-architect vX.Y.Z 출시됨` 배너를 자동으로 출력해 사용자에게 업데이트를 알린다. 네트워크·쉘·버전 비교 로직은 방어적으로 설계되어 실패 시 사용자 흐름을 방해하지 않는다.
+
+### Added
+- **`scripts/check-update.sh` 신규** — SessionStart 훅으로 실행되어 GitHub Releases API (`/repos/leee880619-commits/ClaudeCode-Harness-Setup-Assistant/releases/latest`) 에서 최신 버전을 조회하고, 현재 설치 버전보다 높으면 배너를 stdout 으로 출력한다.
+- **하루 1회 캐시** — `/tmp/harness-architect-update-check-$(id -u)` 에 24시간 캐시. 세션을 여러 번 열어도 GitHub API 호출은 사용자당 하루 1회. 사용자별 UID 분리로 공유 `/tmp` 환경 충돌 방지.
+- **`.claude/hooks/hooks.json` — `SessionStart` 훅 엔트리 추가**. `bash ${CLAUDE_PLUGIN_ROOT}/scripts/check-update.sh` 를 세션 시작 시 실행.
+
+### Security
+- **쉘 인젝션 방어** — 플러그인 경로(`CLAUDE_PLUGIN_ROOT`)와 GitHub API 응답을 python 인라인 코드 내부에 보간하지 않고 `sys.argv` 로 전달. 경로에 공백/특수문자가 포함돼도 안전.
+- **응답 크기 상한** — `curl --max-filesize 65536` (64KB) 로 악의적 응답의 메모리 소모 차단.
+- **타임아웃** — `curl --max-time 5` 로 네트워크 정체 시 세션 시작 지연 최소화.
+- **OS 무관 semver 비교** — BSD `sort` 에 없는 `-V` 플래그 대신 python3 튜플 비교 (`re.match(r"^(\d+)\.(\d+)\.(\d+)")`) 로 macOS/Linux/WSL 모두 이식성 확보.
+- **실패 시 조용히 종료** — `CLAUDE_PLUGIN_ROOT` 미설정, `plugin.json` 부재, `curl`/`python3` 실패, 네트워크 불가, 파싱 실패 등 모든 엣지케이스에서 `exit 0` 으로 사용자 흐름 비방해.
+
+## [0.7.0] - 2026-04-22
+
+프론트엔드 디자인 프리셋 신설. UI 레이어 중심 프로젝트를 대상 프로젝트로 감지하면 하네스 세팅 과정에서 `frontend-designer` + `frontend-ux-reviewer` 에이전트와 `frontend-design` 진입점 스킬이 자동 주입된다. 외부 스킬 추가 설치 없이 자체 내장 색상 규칙(OKLCH·APCA Lc≥60·WCAG AA·2계층 토큰·60-30-10·색맹 대응)만으로 완결 동작. 생성형 파이프라인은 디자이너→리뷰어 필수 페어로 실행되며 3회차 에스컬레이션 래더(1회 자동재작업·2회 사용자 3선택·3회 중단)가 내장되어 있다. Phase 5·6 및 경량 트랙 모두 프리셋 주입 파일을 재작성·덮어쓰기 금지하는 소유권 보호 규약을 준수한다.
+
+### Added
+- **프론트엔드 디자인 프리셋** — UI 레이어 중심 프로젝트 전용 에이전트·스킬·KB 번들.
+  - `knowledge/domains/frontend-design.md` (Full 품질 도메인 KB) — 표준 워크플로우 8스텝, 역할/팀 분업, 도구 스택(React/Vue/Svelte/Tailwind/shadcn/Radix 등), 안티패턴 5개, 5개 1차 출처(Refactoring UI·Design Tokens CG·WCAG 2.2·APCA·web.dev INP).
+  - `.claude/templates/frontend-design/agents/frontend-designer.md` — 토큰 2계층·상태 매트릭스·접근성·모션까지 통제하는 디자이너 에이전트 템플릿. AI 디폴트 거부 원칙.
+  - `.claude/templates/frontend-design/agents/frontend-ux-reviewer.md` — 8차원(D1~D8) 방어적 UX 감사 리뷰어 템플릿. `allowed_dirs: []` 읽기 전용, BLOCK/ASK/NOTE 출력 계약.
+  - `.claude/templates/frontend-design/skills/frontend-design/SKILL.md` — 대상 프로젝트 진입점 스킬. 7단계 작업 절차 + **자체 내장 색상 규칙**(OKLCH·APCA Lc≥60·WCAG AA·2계층 토큰·60-30-10·색맹 대응). 외부 스킬(`color-expert`·`interface-design`)은 옵션 보강일 뿐 의존 아님.
+- **자가 완결성 원칙** — 이 프리셋은 `.claude/templates/frontend-design/` 번들만으로 완결 동작. 사용자가 외부 스킬을 추가 설치하지 않아도 하네스 세팅 과정에서 전부 자동 주입된다.
+- **생성-리뷰 페어 의무화** — `frontend-designer` 의 생성 작업은 `frontend-ux-reviewer` 쌍 리뷰를 필수로 거친다. SKILL.md 와 에이전트 템플릿에 3회차 에스컬레이션 래더(1회 자동 재작업 · 2회 사용자 3선택 · 3회 작업 중단) 내장. 리뷰어 부재는 오류로 처리.
+- **프리셋 소유권 보호** — Phase 5(`agent-team.md`)·Phase 6(`skill-forge.md`)·경량 트랙(`setup-lite.md`) Prerequisites 에 "주입된 프리셋 파일은 재작성·덮어쓰기 금지" 규약 추가. Agent Model Table / Agent-Skill 매핑에 "프리셋 주입 — 재작성 제외" 비고 기록. 보완은 `references/` 하위 별도 파일로만.
+- **백엔드 역가중치** — `fresh-setup` Step 3-E 가중 점수에 역신호 추가: `server/`/`backend/` 디렉터리(−1), 루트 `Dockerfile`+`docker-compose.yml`(−1), 루트 외 추가 백엔드 매니페스트(−1). 풀스택 모노레포에서 백엔드가 메인일 때의 프리셋 오탐 제안 억제.
+- **`allowed_dirs` 자동 재조정** — 프리셋 주입 시 `phase-setup` 에이전트가 대상 프로젝트 실제 디렉터리를 Glob 확인하여 `frontend-designer.md` 의 `allowed_dirs` 를 Edit. 경로 전무 시 `[ASK] 쓰기 권한 디렉터리 확인` Escalation 으로 사용자 답변 대기(안전한 읽기 전용 폴백 유지).
+
+### Security
+- `frontend-designer` 의 `allowed_tools` 에서 무제한 `Bash` 권한 제거. 필요 시 `Bash(npm run lint)` 등 구체 패턴으로만 추가 허용.
+- **`fresh-setup` Step 3-E 신설** — 프론트엔드 디자인 프리셋 신호 감지 (가중 점수). UI 프레임워크(+2), 메타 프레임워크(+2), 스타일링·UI 컴포넌트·모션·디자인 시스템 디렉터리·외부 토큰 파일 감지(각 +1). 점수 ≥ 3 시 Escalation `[ASK] 프론트엔드 디자인 프리셋 주입?`.
+- **도메인 slug 매핑 확장** (`playbooks/domain-research.md`) — "프론트엔드 디자인" / "UI 디자인" / "UI/UX" / "frontend design" → `frontend-design`.
+- **시드 KB 표 갱신** (`knowledge/domains/README.md`) — `frontend-design` (full) 항목 추가.
+
+### Research / Credits
+- 외부 공개 자료 참고 (번들 없음, 원칙 일반화 재작성): `meodai/skill.color-expert` (MIT, 색상 이론·토큰 아키텍처), `oikon48/cc-frontend-skills` (MIT, Anthropic 공식 블로그 참조 구현), `Dammyjay93/interface-design` (MIT, 토큰 메모리 패턴), `pbakaus/impeccable` (MIT, 동사형 액션 분해 영감).
+
+## [0.6.0] - 2026-04-21
+
+오케스트레이터 런타임 라우팅 레이어 신설. 생성된 하네스가 사용자 요청을 무조건 풀 워크플로우로 태우던 구조적 결함(실측 $18.29 오버런, "복잡 웹앱의 4줄 보안 패치 → 3000줄+ 문서" 사례의 근본 원인)을 해결. 기존 Complexity Gate 구조 강제 방식을 **오케스트레이터 재량 기반 라우팅 프로토콜** 로 대체하고, 코드 확인이 필요할 때 메인 세션이 직접 Read 하지 않도록 `code-researcher` 베이스라인 에이전트를 항상 설치.
+
+### Added
+- **오케스트레이터 라우팅 프로토콜 섹션** — 모든 코드 프로젝트의 생성 CLAUDE.md 에 의무 포함. 6개 하위 섹션으로 구성:
+  1. 코드 확인 시 `code-researcher` 선호출 원칙 (메인 세션 컨텍스트 오염 방지)
+  2. 작업 복잡도 3등급 평가 (S: 직접 처리 / M: 취사선택 / L: 전체 워크플로우)
+  3. 리뷰 게이트 우회 금지 — 영구 산출·`mandatory_review` 파이프라인은 S 등급 금지, 최소 M 상향
+  4. 애매 시 M 기본, 매우 애매 시 L. 다운그레이드는 사용자 명시 요청 시만
+  5. 취사선택은 이 하네스의 `.claude/agents/` 내에서만
+  6. 사용자 명시 오버라이드 허용 (Section 3 우회 금지는 오버라이드 불가)
+- **`code-researcher` 베이스라인 에이전트 템플릿 신규** (`.claude/templates/common/agents/code-researcher.md`) — `allowed_tools: [Read, Glob, Grep]`, `allowed_dirs: []` 구조적 read-only. `brief` / `standard` / `detailed` 3단계 상세도 지원. 원문 코드 덤프 금지·의견 제시 금지·요청 범위 초과 탐색 금지 가드레일.
+- **`fresh-setup` Step 3-D 신설** — 코드 프로젝트 감지 로직 (OR: 소스 디렉터리 / 패키지 매니페스트 / Language 감지). 감지 시 Step 6 에서 자동으로 CLAUDE.md 라우팅 프로토콜 섹션 삽입 + `code-researcher.md` 복사. 비코드 프로젝트는 섹션 생략 + 에이전트 스킵.
+- **`setup-lite` Step 1-bis 신설** — 경량 트랙에서 fresh-setup 산출물의 code-researcher 존재 + 라우팅 프로토콜 섹션 존재를 검증. 누락 시 `[BLOCKING]` Escalation 으로 fresh-setup 재소환 유도 (경량 트랙 "산출물 1개" 원칙 유지).
+- **ops-audit Dim F 신설** (`playbooks/ops-audit.md`) — "오케스트레이터 라우팅 프로토콜 + 코드 리서처 베이스라인" 검사. 4개 하위 검사:
+  - F-1: `## 오케스트레이터 라우팅 프로토콜` ATX 헤더 존재 + placeholder 잔존 검증
+  - F-2: `code-researcher.md` 존재, 부재 시 **frontmatter `allowed_tools` 파싱으로 대체자 감지** (grep 키워드 방식보다 FP 감소)
+  - F-3: 섹션 본문의 `code-researcher` 참조 확인
+  - F-4: 리뷰 게이트 우회 가드 문구(`mandatory_review` / `영구 산출`) 존재 확인
+  - Pre-check 로 비코드 프로젝트는 자동 스킵. RISK-HIGH (라우팅 프로토콜 완전 부재) / RISK-MED (리서처 부재·placeholder 잔존·우회 가드 누락) / RISK-LOW (완전 구성 or 면제).
+
+### Changed
+- **`workflow-design.md` Step 4-B 전면 재설계** — 기존 Complexity Gate (S/M/L) **구조 강제** 로직을 **라우팅 프로토콜 섹션 의무 포함** 으로 교체. 멀티 에이전트·strict-coding·대형 코드베이스 프로젝트는 추가로 `pipeline-design` Step 2.5 에서 S/M/L 파이프라인 계약을 생성하도록 전달 (라우팅 프로토콜은 상위 레이어).
+- **`pipeline-design.md` Step 2.5 조건 명시 강화** — workflow-design Step 4-B 가 "Complexity Gate Pipeline Contracts 생성 필요" 를 전달한 경우에만 수행. 소규모 프로젝트는 라우팅 프로토콜만으로 커버 (계약 테이블 생성 불필요).
+- **`ops-auditor.md` description 갱신** — "5개 Dimension" → "6개 Dimension (A~F)".
+
+### Fixed
+- **리뷰 게이트 우회 위험 제거** — 라우팅 프로토콜 Section 3 에서 생성·결정·설계·계획·리서치 파이프라인 또는 영구 산출물 생성 작업의 S 등급 분류를 명시적으로 금지하여, 오케스트레이터 재량 부여가 `pipeline-review-gate.md` 의 `mandatory_review` 원칙을 우회할 수 있었던 구조적 취약점 해결.
+- **`code-researcher` `allowed_dirs` 주석 정확화** — 빈 배열이 "쓰기 허용 디렉터리 없음" 이라는 의미임을 명시. 읽기 권한은 `allowed_tools` 로 제어됨을 주석에 기록 (유지보수자 오해 방지).
+
+### Migration Notes (기존 사용자 주의)
+- **기존 코드 프로젝트 하네스**: `/harness-architect:ops-audit` 실행 시 Dim F 가 라우팅 프로토콜 섹션 부재를 **RISK-HIGH** 로 발행한다. 해소하려면 CLAUDE.md 에 본 릴리스의 라우팅 프로토콜 섹션 템플릿을 수동 추가하거나, `/harness-architect:harness-setup` 재실행 (이 경우 기존 설정을 덮지 않고 섹션만 추가되는 흐름은 향후 과제 — 현재는 수동 편집 권장).
+- **기존 하네스에 `code-researcher` 없음**: Dim F 가 **RISK-MED** 발행. `.claude/templates/common/agents/code-researcher.md` 를 대상 프로젝트 `.claude/agents/code-researcher.md` 로 수동 복사하면 해소됨. 기존 리서처 에이전트(`researcher-agent` 등)가 있고 `allowed_tools` 에 쓰기 도구가 없으면 Dim F F-2 가 대체자로 인정하여 추가 설치 불필요.
+- **strict-coding-6step 프로젝트**: 기존 `researcher-agent` 와 `code-researcher` 가 공존한다. 두 에이전트는 역할이 다름 — `researcher-agent` 는 `research.md` 파일 산출 (워크플로우 스텝), `code-researcher` 는 오케스트레이터 온디맨드 호출용 (채팅 반환). `phase-team` 재실행 시 역할 중복 `[NOTE]` Escalation 이 발생할 수 있으나 병합이 필수는 아님.
+- **비코드 프로젝트(콘텐츠 자동화·순수 문서 저장소)**: 라우팅 프로토콜 섹션 생략 + code-researcher 미설치가 **설계상 정상**. Dim F Pre-check 에서 자동으로 RISK-LOW 면제 처리됨.
+
+### Rejected Alternatives (이 릴리스에서 폐기한 대안)
+- **스킬 레벨 lite 모드 분기 주입 (P4)**: 각 SKILL.md 에 "lite 모드 시 문서 생략 가능" 조항을 박는 안. 기각 사유 — 오케스트레이터가 에이전트를 안 부르면 문서도 안 생기므로, 스킬 계약 대수술 없이 오케스트레이터 재량만으로 동일 목적 달성.
+- **이중 워크플로우 병렬 설계 (heavy + light)**: 워크플로우를 2개 설계하는 안. 기각 사유 — 단일 풀 워크플로우 + 상위 라우팅 레이어 조합이 더 단순하고 오케스트레이터에게 자유도를 제공.
+- **Complexity Gate(S/M/L) 를 모든 프로젝트에 강제**: 소규모 프로젝트에도 동일한 구조 게이트를 박는 안. 기각 사유 — 소규모 프로젝트는 라우팅 프로토콜만으로 충분. 구조 강제는 과설계.
+
+## [0.5.3] - 2026-04-20
+
+CI 오탐지 수정 — `red-team-advisor.md` 환경 이식성 예시 경로가 플러그인 내 하드코딩 경로 검사 grep에 걸리는 문제를 해소.
+
+### Fixed
+- **CI false-positive 수정** (`.claude/agents/red-team-advisor.md`) — Dim 13 "환경 이식성" 체크 항목의 예시 경로(`/Users/`, `/home/`, `C:\Users\`)가 CI `Verify plugin-internal references use ${CLAUDE_PLUGIN_ROOT}` 단계의 grep 패턴(`/Users/[A-Za-z0-9._-]`, `C:\\Users`)에 오탐지되던 문제 수정. 예시를 플레이스홀더 형식(`/Users/{user}/`, `/home/{user}/`, `%USERPROFILE%`)으로 변경하여 의미 보존하면서 false-positive 제거.
+
+## [0.5.2] - 2026-04-20
+
+런타임·운영 관점의 하네스 가드를 대규모로 추가. 세션 연속성·실패 복구 종료 조건·산출물 버저닝·에이전트-스킬 이중 관리 부채·크로스 워크플로우 구조 중복·절대 경로 이식성을 설계(Phase 3·4) / 검증(Phase 9) / 사후 감사(신규 커맨드) 세 층위에서 교차 점검하도록 체계화.
+
+### Added
+- **`/harness-architect:ops-audit` 커맨드 신설** — 기존 하네스 사후 런타임 감사. 5개 Dimension(A: 세션 연속성, B: 실패 복구 완결성, C: Agent-Skill 이중 관리, D: 산출물 덮어쓰기, E: 크로스 워크플로우 구조 중복). RISK-HIGH/MED/LOW 등급 보고서. 파일 수정 금지 (read-only). 신규: `commands/ops-audit.md`, `playbooks/ops-audit.md`, `.claude/agents/ops-auditor.md`. `plugin.json` agents 배열에 등록.
+- **Advisor Dim 13 신설** (`.claude/agents/red-team-advisor.md`, `playbooks/design-review.md`) — "상태 지속성 & 실패 복구 & 운영 부채". **대상 프로젝트 자체가 에이전트 파이프라인/오케스트레이터 구조인 경우에 한해** Phase 3·4·5·6 산출물에 적용 (일반 웹앱/CLI 하네스 설계 산출물에는 스킵하여 메타 누수 방지). 경량 트랙은 상태 지속성·리더 연속성·W5를 NOTE 수준으로 완화하되 W6(덮어쓰기)는 완화 금지.
+- **Advisor Dim 12 본문 신설** (`playbooks/design-review.md`) — "파이프라인 리뷰 게이트 준수". `.claude/rules/pipeline-review-gate.md` 규약을 참조 형식으로 요약하여 Phase 4·5·9 각각의 검사 체크리스트만 인라인. 래더·분류 기준 본문은 규약 파일이 SSoT.
+- **Phase 3 산출물 필수 섹션**: `## Session Recovery Protocol` — 체크포인트 위치·재개 감지 로직·리더 교체 프로토콜·실패 시나리오 4개 소항목. `playbooks/workflow-design.md` Step 4-E 신설.
+- **Phase 4 산출물 필수 섹션**: `## Failure Recovery & Artifact Versioning` — 각 파이프라인별 `max_retries`·timeout·에스컬레이션 분기·버저닝 전략(overwrite_ok/timestamp/version/archive). `playbooks/pipeline-design.md` Step 4.6 신설.
+- **Phase 9 Step 15·16 신설** (`playbooks/final-validation.md`) — 절대 경로 하드코딩 감지(`/Users/`, `/home/`, `/mnt/c/Users/`, `C:\Users\` 패턴, 코드 예시 블록 제외), 스킬·플레이북 간 Jaccard 70% 이상 구조 중복 감지.
+- **`scripts/validate-phase-artifact.sh` 확장** — 파일명 기반 조건부 필수 섹션 검증. `02-workflow-design.md` → `## Session Recovery Protocol`, `03-pipeline-design.md` → `## Failure Recovery & Artifact Versioning`. 경량 트랙 `02-lite-design.md`는 제외.
+- **경량 트랙 공식 운영 가드 선언** (`playbooks/setup-lite.md`) — YAML frontmatter에 `session_recovery: not_applicable` + `artifact_versioning: idempotent` 고정 필드. ops-audit Dim A·D가 이 필드를 감지하여 RISK-LOW 자동 분류 (경량 트랙 사후 감사 오판정 방지). Summary 서두에 "단일 에이전트 단일 패스 — 세션 중단 시 처음부터 재실행 (25~35분)" 명시 필수.
+- **harness-audit ↔ ops-audit 역할 경계 공식화** (`playbooks/harness-audit.md` Guardrails) — harness-audit은 설계·구성 진단, 런타임/운영 부채 5개 Dimension은 ops-audit에 위임. Phase 3 진단 리포트 말미에 `/harness-architect:ops-audit` 실행 권장 1줄 안내.
+- **커맨드 간 양방향 See also** (`commands/ops-audit.md` description + 본문 "관련 커맨드" 표) — harness-setup/harness-audit/ops-audit 3개의 역할·실행 시점·출력 등급 매트릭스.
+- **RISK ↔ BLOCK 등급 매핑 명시** (`commands/ops-audit.md`) — RISK-HIGH ≈ 시급 권장(진행 중단 아님), red-team-advisor BLOCK은 빌드 중 게이팅 전용으로 사후 감사에 대응 개념 없음을 설명.
+
+### Changed
+- **소요 시간 고지 확장** (`commands/harness-setup.md`) — 에이전트 파이프라인/표준 경로에 "Advisor 재검토 발생 시 Phase당 +5~8분 추가" 각주 추가. Phase 3·4 운영 가드 섹션 누락 시 Dim 13 BLOCK 루프로 최악 60분+ 소요 가능함을 명시.
+- **경량 트랙 고지 강화** (`.claude/rules/orchestrator-protocol.md`) — 트랙 판별 AskUserQuestion 문구에 "단일 에이전트 단일 패스 — 세션 중단 시 재개 불가, 처음부터 재실행 필요" 주의사항 추가.
+- **SSoT 양방향 교차 참조 명확화** (`playbooks/final-validation.md` Step 16 ↔ `playbooks/ops-audit.md` Dim E) — Jaccard 70% 임계값과 비교 로직이 두 파일의 양방향 SSoT이며 한쪽 변경 시 다른 쪽 동반 갱신 필수임을 양쪽 주석에 명시.
+
+### Fixed
+- **Dim 번호 순서 꼬임 3곳 수정** — `.claude/agents/red-team-advisor.md`의 `11→13→12` 역순, `playbooks/design-review.md`의 `9→11→10→13` 비연속(Dim 12 섹션 누락), `playbooks/final-validation.md`의 `13→15→16→14` 순서. 모두 순방향 연속 재배치. Dim 번호 자체는 불변 유지 (`orchestrator-protocol.md`의 Skip Gate `[Scope] Dim 6+12만 검사` 같은 기존 인용 보존).
+
+### Migration Notes (기존 사용자 주의)
+- **기존 하네스 재개 시**: 이 릴리즈로 업데이트 후 재개하는 세션이 Phase 3·4 산출물을 가지고 있으면, `validate-phase-artifact.sh` 가 `## Session Recovery Protocol` 또는 `## Failure Recovery & Artifact Versioning` 섹션 부재로 실패한다. 이 경우 오케스트레이터가 해당 Phase 에이전트를 재소환하여 섹션을 보완한다 — Advisor Dim 13이 "단일 세션 완결 — 복구 프로토콜 미필요" 한 줄 도피를 감지하여 다중 에이전트 프로젝트에서 BLOCK을 재발행할 수 있다.
+- **경량 트랙 재진입**: 기존 `02-lite-design.md` 는 `session_recovery`·`artifact_versioning` 필드가 없다. Phase L 에이전트 재소환 또는 사용자 수동 frontmatter 편집 필요.
+- **에이전트 파이프라인 프로젝트의 Advisor 비용**: 운영 가드 누락 시 Phase 3·4에서 Advisor 루프가 Phase당 최대 2회 추가 발생할 수 있다 (기존 비용 대비 +$0.8~1.6). 단순 웹앱/CLI 프로젝트는 Dim 13 스킵으로 비용 변화 없음.
+- **후속 리팩터링 이슈**: `validate-phase-artifact.sh` 의 Phase별 필수 섹션 목록 하드코딩은 향후 `scripts/artifact-schema.yaml` 분리 검토 대상 (현재는 파일명 4건 분기만 존재하여 drift 리스크 낮음).
+
+## [0.5.1] - 2026-04-20
+
+항상 로드되는 규칙 파일·CLAUDE.md·red-team-advisor 에이전트 정의에서 TMI·중복 정의·과도한 예시 제거. 기능 동작 변경 없음.
+
+### Changed (문서 슬림화)
+- **AskUserQuestion 소유권 중복 제거** (`orchestrator-protocol.md`) — `question-discipline.md`와 이중 정의되어 있던 섹션 본문을 링크 한 줄로 축약. 드리프트 위험원 제거.
+- **컨텍스트 예산 관리 섹션 삭제** (`orchestrator-protocol.md`) — 규칙이 아닌 정보성 서술이라 제거.
+- **Phase별 Context for Next Phase 표 뒤 마무리 문장 / 반환 포맷 섹션별 bullet 설명 제거** (`orchestrator-protocol.md`) — 코드블록 예시로 충분.
+- **"스펙 대비 강화된 조건" 이력성 괄호주석 제거** (`orchestrator-protocol.md`) — 판별 기준은 그대로.
+- **도메인 식별 절차 서술 압축** (`orchestrator-protocol.md`).
+- **Rejected Alternatives 이유 설명 축약** (`orchestrator-protocol.md`).
+- **meta-leakage-guard.md 압축** — 영문 장문 해설을 한국어 핵심 규칙으로 재작성. Self-Check 3문항은 유지.
+- **pipeline-review-gate.md 원칙/리뷰어 예시/Guardrails 서술 압축** — 리뷰어 예시 3종 → 1종 (research-redteam). 도그푸딩 맥락 설명 제거. 규칙 본문은 그대로.
+- **output-quality.md 서브에이전트 실행 모드 플로우 명료화** — 6개 bullet 구조 유지.
+- **CLAUDE.md 중요 원칙 섹션 해설 축약** — 각 원칙 1줄 + 규칙 파일 참조.
+- **red-team-advisor.md Output Format Tagging 예시 축약** — BLOCK 4건/ASK 2건 → 각 1건.
+
+### Preserved (건드리지 않은 것)
+- Phase Gate 필수 산출물 표, 트랙 판별 8조건, Advisor Skip Gate 5조건, Model Confirmation Gate 8단계, 에스컬레이션 래더 3회차, 프론트매터 필드 정의, Dim 1~12 상세 정의, Complexity Gate S/M/L 계약.
+- `scripts/validate-phase-artifact.sh`, `scripts/validate-meta-leakage.sh` 등 외부 검증 스크립트.
+
+### Metrics
+- 항상 로드되는 규칙 파일·CLAUDE.md 합산 ~53줄 절감 (~1,100 tokens). 세션당 API 비용 절감은 미미(Sonnet ~$0.01, Opus ~$0.06)하나 cache write 페널티 완화 + 장기 세션 compaction 트리거 지연 + 규칙 파일 가독성 향상 효과.
+
+## [0.5.0] - 2026-04-20
+
+실측 비용 데이터 기반의 대대적 비용 최적화 릴리즈. 단일 세션 $12.52 → ~$5 수준을 목표.
+
+### Changed (비용 최적화 — 이 플러그인 자체)
+- **Red-team Advisor 모델 다운그레이드** (`red-team-advisor.md`) — `model: opus` → `model: claude-sonnet-4-6`. 6회 Advisor 실행이 전체 비용의 ~34%를 차지하던 최대 드라이버 제거. 예상 절감 ~$3.4/세션. 설계 질 검증보다 체크리스트·패턴 매칭이 주 업무이므로 Sonnet으로 충분.
+- **단순 Phase 에이전트 모델 다운그레이드** — `phase-setup`, `phase-workflow`, `phase-hooks`, `phase-validate` 를 `opus` → `claude-sonnet-4-6` 로 변경. 스캔·워크플로우 스텝 나열·훅 wiring·구조 검증은 Sonnet으로 충분. 예상 절감 ~$3.2/세션. 복잡 설계를 요하는 `phase-pipeline`/`phase-team`/`phase-skills`/`phase-domain-research` 는 Opus 유지.
+
+### Added (Advisor 정확도 개선)
+- **[Confirmed User Decisions] 필드** (`orchestrator-protocol.md`) — Red-team 소환 템플릿에 이전 Phase들의 AskUserQuestion 응답 누적 목록 전달. Advisor가 이미 사용자가 확정한 사항에 BLOCK/ASK를 잘못 발행하는 구조적 문제(실측 ~$0.8/세션 재작업) 해결. 오케스트레이터는 Phase 0 사전 인터뷰·Escalation 처리·Model Confirmation Gate 응답을 누적해 전달 의무.
+- **Advisor Skip Gate** (`orchestrator-protocol.md`) — 풀 트랙 Phase 3/4/7-8 한정, 에이전트 반환 Escalations가 `[BLOCKING]`/`[ASK]` 0건이고 산출물 구조 검증 1회 통과 시 경량 Advisor(Dim 6 보안 + Dim 12 파이프라인 리뷰 게이트만)로 대체. Phase 5·6(설계 중요)·Phase 1-2·2.5·9(전체 검증 필요)는 스킵 금지. 예상 절감 ~$1.5~2.9/세션 (Skip Gate 진입률에 비례).
+
+### Added (대상 프로젝트 하네스 생성 품질)
+- **Complexity Gate S/M/L 필수 포함** (`workflow-design.md` Step 4-B) — 에이전트 파이프라인 / 멀티 에이전트 프로젝트는 워크플로우 최상단에 STEP -1 Complexity Gate(태스크 크기 S/M/L 분류)를 **반드시** 포함하도록 강제. 누락 시 보안 패치 4줄 작업도 풀 파이프라인 강제되어 실측 $18.29 수준의 오버비용 발생. S 등급은 메인 세션 직접 편집 허용(`ORCHESTRATOR_DIRECT=1`).
+- **ORCHESTRATOR_DIRECT 예외 필수 포함** (`hooks-mcp-setup.md` Step 2) — 대상 프로젝트 `ownership-guard.sh` 템플릿에 S 등급 early-exit 블록 삽입을 필수화. Complexity Gate와 짝을 이뤄 동작. 파괴적 패턴(`rm -rf /` 등)은 계속 차단되도록 위치 지정.
+- **Specialist Review 트리거 조건 강화** (`workflow-design.md` Step 4-C) — L 등급 + UI 디렉터리 변경 + 명시적 플래그 3조건 AND 시에만 design/ux/security review 병렬 호출. S/M 등급은 QA 단독. 실측으로 Specialist 3종이 loop-back 포함 L 등급 비용의 ~30% 점유.
+- **Handoff 문서 분리 원칙** (`workflow-design.md` Step 4-D) — 세션 간 상태 전달 문서는 `next-session-handoff.md`(최신+직전 1개, 10KB 이내) + `session-history.md`(아카이브, @import 비대상) 분리. 누적 증가 방지. 실측으로 60KB 단일 파일 → 세션당 cache write ~$2~3 추가 비용.
+
+### Technical Notes
+- 다운그레이드 대상 4개 Phase 에이전트(phase-setup/phase-workflow/phase-hooks/phase-validate)는 작업 성격이 스캔·나열·wiring·구조 검증 중심이므로 Sonnet으로 충분하다고 판단. **A/B 비교 실측은 아직 수행되지 않음** — v0.5.x 기간 중 누적 세션 데이터로 재검증 예정. 품질 저하가 관측되면 Model Confirmation Gate로 개별 재조정 가능.
+- Red-team Advisor 다운그레이드는 Dim 1~12 체크리스트 기반 검증이라 패턴 매칭 성격이 강하다고 판단했으나, **긴 산출물(>500줄) 검토에서 section miss 가능성**이 자체 검증 과정에서 관측됨. 실사용 중 false negative가 누적되면 재조정 필요.
+- Skip Gate는 `advisor_status: pass:skip-gate` 접미사로 감사 추적 가능. 재개 시 "경량 검증만 받았음" 식별.
+- ORCHESTRATOR_DIRECT는 단일 환경변수가 아니라 **per-task 토큰 + 민감 경로 블랙리스트 + 사용자 명시 승인** 3중 가드로 설계 (hooks-mcp-setup.md Step 2 참조).
+
+## [0.4.1] - 2026-04-18
+
+### Changed
+- **Blackbox QA 서버 종료 지침 강제화** (`strict-coding-6step` 템플릿) — 테스트 종료 후 서버가 좀비 프로세스로 남는 문제를 방지하기 위해 다음 변경 적용:
+  - `agents/qa-blackbox-agent.md` Rules — Cleanup(서버 종료)을 필수 단계로 명시. 종료 대상을 "서버, 자식 프로세스, 브라우저 자동화 세션, 임시 컨테이너"로 구체화. PASS/FAIL·예외·중단 무관 반환 직전 필수 실행. 직접 기동하지 않은 프로세스는 종료 금지. Cleanup 실패 시 PID·포트를 보고서 Regressions 섹션에 명시.
+  - `playbooks/qa-blackbox.md` Workflow — Step 2(환경 준비)에 포트 충돌 사전 확인 및 PID·포트 즉시 기록 의무화 추가. Step 7(Verdict) 직후 Step 8 **"Cleanup (필수)"** 신규 삽입 (docker-compose 포함, 포트 해제 확인, 종료 실패 시 보고 포함). 기존 Step 8 보고서 작성은 Step 9로 이동.
+  - `playbooks/qa-blackbox.md` Guardrails — 동일 종료 지침을 이중 방어로 추가. "직접 기동하지 않은 프로세스 종료 금지" 명시.
+
+## [0.4.0] - 2026-04-18
+
+### Added
+- **경량 트랙 (Phase L)** — 8개 AND 조건(솔로, 웹앱/CLI, 비에이전트, 에이전트·Strict Coding 신호 없음, 소스 파일 ≤100개·깊이 ≤5, 배포 단순, 단일 서비스) 충족 시 Phase 3-6을 단일 에이전트 `phase-setup-lite`가 25~35분에 처리. 신규: `playbooks/setup-lite.md`, `.claude/agents/phase-setup-lite.md`. Phase L 완료 후 "Phase 7-8 스킵 가능" 플래그 기반 분기 명시.
+- **`scripts/validate-phase-artifact.sh`** — Phase 산출물 Markdown 구조 자동 검증. frontmatter 4필드 + 공통 5섹션 + Phase 9 전용 3섹션. Phase Gate에서 오케스트레이터가 명시적 Bash 호출(exit 0/1).
+- **`examples/generated/`** — `web-app-solo`(솔로 React/Node 경량 트랙) + `agent-pipeline`(멀티에이전트 딥리서치) 두 가지 참조 예시. `CLAUDE.md` · `settings.json` · rules/agents 포함. sanitized + 버전 메타데이터.
+- **`README.md` 30초 퀵스타트** — 설치·실행 3단계 + 생성 파일 트리 + 예상 소요 시간 표(트랙별) 삽입.
+- **Phase 9 완료 안내** (`commands/harness-setup.md`) — 완료 후 생성 파일 목록 + 사용법 1~4단계 + 재실행 명령어 출력 지시 추가.
+- **Phase 0 소요 시간 고지** (`commands/harness-setup.md`) — 트랙 결정 직후 예상 소요 시간 자동 출력 지시 추가.
+- **`CONTRIBUTING.md` 예시 파일 업데이트 체크리스트** — sanitization·버전 메타데이터·파일 수 ≤3개 확인 의무화.
+
+### Changed
+- **경량 트랙 판별 조건 5개 → 8개** (`orchestrator-protocol.md`) — 코드베이스 규모(소스 파일 ≤100개·깊이 ≤5), 배포/환경 복잡도(`.env.staging` 없음·CI ≤1개), 서비스 복잡도(단일 서비스) 3개 조건 추가. "솔로=단순" 가정 제거 및 경고 명문화.
+- **`fresh-setup.md` 복잡도 신호 스캔 추가** — 소스 파일 수·최대 디렉터리 깊이·환경 파일 목록·CI 워크플로우 수·docker-compose 서비스 수·루트 외 `package.json` 수 6종 스캔 항목 + Context for Next Phase 숫자 형식 기록 명세.
+- **Phase Gate 검증 3단계 절차** (`orchestrator-protocol.md`) — 파일 존재 → `validate-phase-artifact.sh` Bash 호출(포맷 루프, 1회) → Advisor BLOCK 루프(2회) 명시적 분리. 소환 템플릿에 `[Output Contract]` 자기점검 체크리스트 추가.
+- **`syntax-check.sh`** — Phase 산출물 패턴(`/docs/*/NN-*.md`) 감지 시 `validate-phase-artifact.sh` 경고 신호 출력. exit 0 유지(차단 아닌 경고 전용).
+- **`ARCHITECTURE.md`** — Dimensions 표 Dim 11(모델 드리프트)·Dim 12(파이프라인 리뷰 게이트) 추가. Phase L 행, 경량 트랙 8조건, 복잡도 게이트 기준 `track: lightweight` 기반으로 갱신.
+- **모델 버전 업데이트** — `claude-sonnet-4-5` → `claude-sonnet-4-6`, `claude-opus-4-6` → `claude-opus-4-7` (에이전트 정의, examples 예시 파일, knowledge 참조 예시).
+
+## [0.3.3] - 2026-04-18
+
+### Changed
+- **Phase 에이전트에 `## Input Context` 섹션 추가** — 7개 Phase 서브에이전트(`phase-domain-research`, `phase-workflow`, `phase-pipeline`, `phase-team`, `phase-skills`, `phase-hooks`, `phase-validate`)가 작업 시작 전 **이전 Phase 산출물(`docs/{요청명}/NN-*.md`)을 전체 Read하도록 강제**. 각 에이전트 정의 파일에 필수 입력 파일 목록과 "Summary는 힌트, 파일이 source of truth" 원칙을 명시.
+  - 배경: `orchestrator-protocol.md` 는 "다음 에이전트는 이전 파일을 Read하여 `## Context for Next Phase` 섹션에서 상세 컨텍스트를 확보한다"고 **설계 의도**를 기술했으나, 에이전트 정의·플레이북 레벨에서 **강제 지시가 누락**되어 있었음. 에이전트가 프롬프트의 ~200단어 Summary만 보고 작업을 시작할 위험이 실존.
+  - 제외: `phase-setup`(Phase 1-2는 선행 산출물 없음 — Phase 0은 경로 수집만), `red-team-advisor`(이미 `orchestrator-protocol.md` 에 "필요 시 Advisor가 직접 이전 산출물을 Read" 명시).
+  - Phase 9(`phase-validate`)에는 "전체 산출물(`00~06`)을 교차 검증"하도록 확장 지시.
+
+## [0.3.2] - 2026-04-18
+
+### Changed
+- **Strict Coding 6-Step 제안 임계값 이원화** — 기존 "신호 2개 이상 → `[ASK]`" 단일 기준을 이원화:
+  - 2개 이상 → `[ASK]` (의사결정 요청, 기존 동작 유지)
+  - 정확히 1개 → `[NOTE]` (정보 전달만, 사용자가 Phase 3에서 원하면 채택 가능)
+  - 0개 → 기록하지 않음
+  - **예외**: 단일 신호가 #7(사용자 의지 발화 — "엄격", "production-ready" 등)이면 `[ASK]`로 승격. 명시적 품질 의지 표명 시 질문 누락 방지.
+  - 단일 신호 프로젝트(예: tsconfig strict만 있는 POC)에도 워크플로우 존재를 소개하면서, `question-discipline` 의 "합리적 복수 선택지일 때만 질문" 원칙과 양립.
+  - Phase 3 `workflow-design` Step 0 범위 명시: Phase 1-2가 `[ASK]`로 이미 결정 완료한 케이스는 재검토하지 않고, `[NOTE]` 단일 신호 케이스만 재검토 + 사용자 명시 요청 시 채택.
+  - 수정: `playbooks/fresh-setup.md` Step 3-B, `playbooks/workflow-design.md` Step 0, `knowledge/13-strict-coding-workflow.md` 적용 판단 기준·절차.
+
+## [0.3.1] - 2026-04-17
+
+### Added
+- **Pipeline Review Gate** (`.claude/rules/pipeline-review-gate.md`) — 대상 프로젝트의 워크플로우 파이프라인 중 **생성·결정·설계·계획·리서치** 출력을 내보내는 파이프라인에 대해 **도메인 전문 레드팀 리뷰어** 스텝을 말단에 **필수 포함**하도록 강제하는 권위 규칙. 메타 레벨 Red-team Advisor 패턴을 대상 프로젝트 런타임으로 전파하는 도그푸딩.
+  - 파이프라인 분류: `mandatory_review` / `exempt_eligible` (결정론적 변환/단순 I/O/조회/실행만 면제, `exempt_reason` 필수).
+  - **에스컬레이션 래더 (3단)** — BLOCK 1회: 오케스트레이터 자동 승인 재실행 / BLOCK 2회: 사용자 AskUserQuestion (재실행·수용·수동 편집) / BLOCK 3회: **작업 전면 중단** + 3선택 (무시·수동 개입·파이프라인 스킵).
+  - 리뷰어 도메인 특화 의무 (`{domain}-redteam` 컨벤션), 리뷰어 쓰기 권한 금지, 리뷰의 리뷰 재귀 금지, 복잡도 게이트로 스킵 불가.
+- **Phase 4 Step 4.5 — 파이프라인 리뷰 게이트 분류** (`playbooks/pipeline-design.md`). 파이프라인 분류·리뷰어 배치·도메인 Dimension 초안 작성. Output Contract에 `## Pipeline Review Gate` 필수 섹션 추가. Context for Next Phase에 `Pipeline Review Gate Decisions` 표 포함 (Phase 5 리뷰어 프로비저닝 입력).
+- **Red-team Advisor Dimension 12 — 파이프라인 리뷰 게이트 준수** (`.claude/agents/red-team-advisor.md`). Phase 4 필수 적용, Phase 5·9 확장 적용. 리뷰 스텝 누락·`exempt_reason` 공백·범용 Advisor 공유 커버·재귀 구조·래더 본문 복붙·리뷰어 쓰기 권한 부여를 BLOCK으로 감지.
+
+### Changed
+- `playbooks/pipeline-design.md` Guardrails — 도메인 리뷰어 6개 금지 사항 추가 (누락·공유 커버·쓰기 권한·재귀·래더 복붙·복잡도 스킵). 에이전트 수 상한에서 도메인 리뷰어는 별도 취급.
+- Phase 4 산출물 다이어그램 예시 — `mandatory_review` 파이프라인 말단에 리뷰어 스텝 명시, `exempt` 파이프라인은 사유 표기.
+
+### Notes
+- 이 변경은 Phase 5(`agent-team`)·Phase 6(`skill-forge`)·Phase 9(`final-validation`) 플레이북 수정 없이 연계됨 — 기존 플레이북이 Phase 4의 Context for Next Phase를 Read하는 구조이므로 자동 전파. 향후 v0.4 에서 도메인 리뷰어용 SKILL.md 템플릿(`{domain}-redteam` 컨벤션 박스) 표준화 예정.
+
+## [0.3.0] - 2026-04-17
+
+### Added
+- **Phase 0 A5 — "기본 성능 수준" 인터뷰 질문** (경제형 / 균형형(권장) / 고성능형). 답변은 Phase 5 `phase-team` 프롬프트에 `[Model Tier]` 로 전달되어 에이전트별 모델 자동 배정의 힌트가 된다.
+- **Phase 5 모델 매트릭스** (`playbooks/agent-team.md` Step 3). 역할 복잡도(복잡 설계 / 구현 / 단순 검증) × 티어(경제/균형/고성능)의 3×3 매트릭스로 에이전트별 모델을 자동 배정. 매트릭스 이탈 시 근거를 Escalations에 기록.
+- **Phase 6 완료 직후 — Model Confirmation Gate** (`.claude/rules/orchestrator-protocol.md`). 스킬 완성 후 에이전트-모델-스킬 통합 표를 1회 AskUserQuestion으로 제시, "전체 승인 / 개별 조정 / 티어 일괄 변경" 선택. 에이전트 ≥ 2 일 때만 실행, 복잡도 게이트와 무관하게 항상 실행. 상대 비용 힌트(Opus ≈ Sonnet × 5, Sonnet ≈ Haiku × 3) 표기.
+- **Gate 재소환 상한 2회** + 소진 시 "수용 / 수동 편집" 2선택 (Advisor 루프 패턴과 동일).
+- **재소환 후 Dim 11 한정 경량 Advisor 재실행** — 재작성된 `04-agent-team.md` / `05-skill-specs.md` 에 대해 모델 드리프트·미스매치만 재검증.
+- **Red-team Dimension 11 — 모델-복잡도 미스매치** (`playbooks/design-review.md`, `.claude/agents/red-team-advisor.md`). Phase 5·6 전용. 복잡 설계에 haiku → BLOCK, 단순 검증에 opus → ASK. `04-agent-team.md` ↔ `.claude/agents/*.md` frontmatter ↔ SKILL.md 3중 드리프트 감지.
+- **`05-skill-specs.md` 모델 필드 3중 일관성 검증** (`playbooks/skill-forge.md` Step 9).
+
+### Changed
+- **CLAUDE.md에 에이전트 모델 기재 금지** (`playbooks/agent-team.md` Step 6). `## 에이전트 팀 구조` 섹션은 `@import docs/{요청명}/04-agent-team.md` 한 줄만. 모델의 단일 진실(source of truth)은 `.claude/agents/{이름}.md` frontmatter `model` 필드. Confirmation Gate 재조정 시 CLAUDE.md 본문을 건드리지 않아 드리프트 원천 차단.
+- **`04-agent-team.md` frontmatter `model_confirmation` 필드** (`pending` / `confirmed` / `manual_override`). 재개 시 `confirmed` 가 아니면 Gate 재진입 대상. 재개 안전 체크: Agent Model Table ↔ agents/*.md frontmatter 1회 sanity check.
+- **Rejected Alternatives 누적 상한** — 최근 1개(직전 배정)만 유지, 더 오래된 이관은 한 줄 압축 주석으로 교체 (파일 비대화 방지).
+- **메타 누수 정규식 보강** (`checklists/meta-leakage-keywords.md`, `scripts/validate-meta-leakage.sh`) — `기본 성능 수준` / `모델 티어` / `Model Tier` / `Model Confirmation Gate` / `경제형 … 균형형 … 고성능형` 근접 패턴 추가. `docs/{요청명}/NN-*.md` 표준 산출물은 스캔 제외.
+
+## [0.2.2] - 2026-04-17
+
+### Added
+- **Q10 — "Ask-first when uncertain" 지침 옵션** (기본 권장: Yes). `playbooks/fresh-setup.md`, `playbooks/cursor-migration.md`에 사용자 질문을 Escalations로 기록하고, Yes 응답 시 생성되는 CLAUDE.md에 "워크플로우·파이프라인과 무관하게 결정이 모호하면 AskUserQuestion으로 먼저 확인" 취지의 1~2줄 규약을 삽입한다.
+- `playbooks/harness-audit.md`: Anti-pattern 감지에 `Missing Ask-first directive` (LOW) 추가. 기존 CLAUDE.md 본문 재작성 없이 append-only로 규약을 보강하는 특례 경로 명시.
+
+## [0.2.1] - 2026-04-17
+
+### Added
+- `/harness-architect:help` slash command (`commands/help.md`) — 플러그인 사용법, 9-Phase 흐름, 재개 방법, 생성 파일 트리, 문제 해결 안내를 정적으로 출력.
+
+## [0.2.0] - 2026-04-17
+
+### Added
+- **Phase 2.5 — Domain Research** (optional). A new agent `phase-domain-research` + playbook `playbooks/domain-research.md` collect industry-standard workflows, team roles, and tool stacks for the project's core domain, using a curated KB first and live web research as fallback.
+- `knowledge/domains/` reference KB with 8 seed domains (5 full: deep-research, code-review, technical-docs, website-build, data-pipeline — and 3 stub: webtoon-production, youtube-content, marketing-campaign). Stub domains automatically trigger live search mode.
+- `knowledge/domains/README.md` authoring contract: minimum 3 primary sources per full KB, stub/full quality frontmatter field.
+- Phase 2.5 artifact: `docs/{요청명}/02b-domain-research.md` (file numbering preserves existing 02-07 chain — no cascade renumbering).
+- Phase 3-6 playbooks (`workflow-design`, `pipeline-design`, `agent-team`, `skill-forge`) now optionally Read the Phase 2.5 artifact when present. Domain patterns are cited in downstream designs.
+- Red-team Advisor (`playbooks/design-review.md`) gained a Dimension 6 for domain research consistency including source URL validation (renumbered to Dimension 10 in a later change — see below).
+- `final-validation.md` Step 1 inventory + Step 3 consistency check now covers `02b-domain-research.md`.
+- `.claude/settings.json` allows `WebSearch` and `WebFetch` so Phase 2.5 can run without permission prompts.
+- **Slash-command argument support**: `/harness-architect:harness-setup /path/to/project` — Phase 0 의 경로 질문을 생략하고 인터뷰로 바로 진입.
+- **Advisor Dimensions 6~9 추가** — 보안 권한 적절성(Dim 6), 타깃 프로젝트 특이성(Dim 7), 에이전트 소유권 충돌(Dim 8), 미기록 결정 감지(Dim 9). 기존 도메인 리서치 정합성은 Dim 10으로 재배치. 각 BLOCK/ASK/NOTE 항목에 `[Dim N]` 태그 부여.
+- **Advisor BLOCK 루프 소진 후 3개 선택지** — "무시/수동개입/스킵"을 AskUserQuestion으로 제시. `status: manual_override` 로 frontmatter 갱신.
+- **Phase 산출물 YAML frontmatter** (`phase`/`completed`/`status`/`advisor_status`). 기존 HTML 주석은 역호환 fallback.
+- **`scripts/validate-settings.sh`** (jq 기반) — `permissions.allow` 위험 패턴·필수 `deny`·비밀값 패턴 정적 검증. Phase 9 `final-validation` Step 5 에서 자동 호출.
+- **`scripts/validate-meta-leakage.sh`** — 대상 프로젝트 하네스 생성 파일의 메타 용어 grep/regex 스캔. 인자로 스캔 루트 지정.
+- **Phase 7.1 — MCP 설치 실패 복구 프로토콜** (`playbooks/hooks-mcp-setup.md`). 설치 실패 시 settings.json 롤백 + 수동 설치 가이드 Escalation.
+- `CONTRIBUTING.md` 보강: Phase/규칙 변경 체크리스트, 명명 규약 (파일명 ↔ frontmatter `name` ↔ `subagent_type` 삼자 일치), 외부 의존성 리스크 섹션, `knowledge/VERSION.md` 범프 가이드, `validate-*.sh` 로컬 테스트 + 파일명 일치 검증 커맨드.
+- `examples/cli-arg-usage.md` — 슬래시 커맨드 경로 인자 사용 시나리오 예시.
+
+### Changed
+- Domain identification is solicited via Phase 1-2 Escalation (`[ASK] 핵심 도메인 식별`) rather than Phase 0 AskUserQuestion, preserving the Phase 0 "≤4 questions" rule in `question-discipline.md`.
+- Fast Track / Fast-Forward paths explicitly specify Phase 2.5 skip triggers ("해당 없음" answer, `--fast` keyword).
+- **보안 감사는 복잡도 게이트와 무관하게 항상 전체 실행** (Advisor Dim 6, `final-validation` Step 5). 단순 프로젝트에서도 `Bash(*)` / 비밀값 / 필수 `deny` 검사는 경량화 대상이 아님.
+- **Phase Gate가 파일 존재만이 아니라 필수 섹션 헤더 정규식 매칭까지** 검증 (공통 5섹션 + Phase 9의 전용 3섹션).
+- **CLAUDE.md 단일 소유자 원칙** — 본문은 Phase 1-2(`phase-setup`)만 작성. Phase 3-6은 `@import` 링크 추가만 허용. 적용 시점: 신규 설치만 (기존 하네스는 `harness-audit` 에서 재구성 확인).
+- **`ownership-guard.sh` fail-closed 강화** — TPR 미설정 + `docs/{요청명}/NN-*.md` 경로 쓰기 시도는 exit 1. TPR 미설정 + 플러그인 범위 내 Write는 기여자 모드로 허용하되 stderr 감사 로그.
+- **Source of Truth 규약** — 산출물 파일 > Summary. 불일치 시 파일 기준 재작성. Context for Next Phase에 `### 기각된 대안` 하위 항목 필수.
+- **Non-blocking Escalation 보류 한계** — 다음 Phase Advisor 리뷰 종료 직후까지만. 2개 이상 Phase 건너뛰며 보류 금지 (맥락 손실 방지).
+- **진행 피드백 UX** — 각 Phase 시작 시 "최대 재시도 2회, 예상 소요" 노출. Advisor 재시도 카운터(`🔁 Advisor 재검토 (M/2회차)`), BLOCK 루프 소진 시 별도 안내.
+- **Advisor 프롬프트 슬림화** — "Previous Phases Summary"(누적) → "직전 Phase Summary"(N-1만). Advisor가 필요 시 산출물 파일을 직접 Read.
+- **재개 프로토콜 강화** — 다수 작업 폴더 선택, 수정 감지 시 상류·하류 Phase 영향 평가, 비표준 파일명 `^[0-9]{2}[a-z]?-[a-z-]+\.md$` 엄격 매칭, 미해결 Escalation 복원.
+- **메타 누수 키워드 확장** — 한국어 변형("질문 규율", "점진적 공개 방식", "하네스 설정 도구" 등)·띄어쓰기 변형("메타 누수") 추가. `checklists/meta-leakage-keywords.md` 에 정규식 힌트 섹션 추가.
+- **`skill-forge` Guardrail** — 대상 프로젝트의 `.claude/skills/*/SKILL.md` 에 오케스트레이션 로직(에이전트 소환·Phase 전환 지시) 포함 금지. 도메인 로직만 허용.
+- **AskUserQuestion 우회 감지** — Escalation 수 0건인데 사용자 확인 없는 결정 흔적이 있으면 `[재확인]` 으로 AUQ에 자동 올림.
+- Phase 에이전트 8종 모두 `## Rules` 섹션 최상단에 "⚠ **AskUserQuestion 절대 호출 금지**" 강조 문구.
+- `commands/harness-setup.md` "세션 시작 시 필수 로드 4개 Read 지시" 제거 — `.claude/rules/*.md` 가 always-apply 로 자동 로딩되므로 중복. 참고 목록 형태로만 유지.
+
+### Notes
+- 레드팀 외부 감사 리포트(`docs/redteam-review-20260417/`) Tier 1-3 지적 31건 중 반영 범위 내 항목 전원 처리. B-State-1 (.state.json 인덱스)은 배포본 호환 비용으로 판정 ✅→🟡 로 투명 하향 — 상세 이력은 `docs/redteam-review-20260417/01-findings.md`.
+
+## [0.1.0] - 2026-04-17
+
+Initial public release (soft launch).
+
+### Added
+- Plugin manifest (`.claude-plugin/plugin.json`) with custom component paths for `.claude/agents/`, `commands/`, and `.claude/hooks/hooks.json`.
+- Self-hosted single-plugin marketplace (`.claude-plugin/marketplace.json`).
+- Orchestrator slash command `/harness-architect:harness-setup` (entry point at `commands/harness-setup.md`).
+- 8 Phase workers under `.claude/agents/`:
+  `phase-setup`, `phase-workflow`, `phase-pipeline`, `phase-team`, `phase-skills`, `phase-hooks`, `phase-validate`, `red-team-advisor`.
+- 11 playbooks under `playbooks/` (Agent-Playbook separation — HOW files, not exposed as Skills to the main session).
+- 4 always-apply rules under `.claude/rules/`:
+  `orchestrator-protocol`, `question-discipline`, `output-quality`, `meta-leakage-guard`.
+- 2 plugin hooks under `.claude/hooks/`:
+  `ownership-guard.sh` (PreToolUse Write/Edit — scope guard) and `syntax-check.sh` (PostToolUse Write/Edit — JSON/YAML validation).
+- 14-file knowledge base under `knowledge/` (commentary derived from Claude Code documentation).
+- 3 validation checklists under `checklists/`:
+  `validation-checklist`, `security-audit`, `meta-leakage-keywords`.
+- `strict-coding-6step` workflow preset under `.claude/templates/workflows/` for complex coding projects (8 agents + 8 playbooks).
+- Documentation: `README.md` (Korean), `ARCHITECTURE.md`, `LICENSE` (Apache-2.0).
+
+### Known limitations
+- English README (`README_EN.md`) and `examples/` scenarios are incomplete in this release — see Unreleased.
+- Submission to the official Anthropic plugin marketplace has not been completed; installation currently relies on GitHub-hosted marketplace path.
+
+[Unreleased]: https://github.com/leee880619-commits/ClaudeCode-Harness-Setup-Assistant/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/leee880619-commits/ClaudeCode-Harness-Setup-Assistant/compare/v0.3.3...v0.4.0
+[0.3.3]: https://github.com/leee880619-commits/ClaudeCode-Harness-Setup-Assistant/releases/tag/v0.3.3
+[0.3.2]: https://github.com/leee880619-commits/ClaudeCode-Harness-Setup-Assistant/releases/tag/v0.3.2
+[0.3.1]: https://github.com/leee880619-commits/ClaudeCode-Harness-Setup-Assistant/releases/tag/v0.3.1
+[0.3.0]: https://github.com/leee880619-commits/ClaudeCode-Harness-Setup-Assistant/releases/tag/v0.3.0
+[0.2.2]: https://github.com/leee880619-commits/ClaudeCode-Harness-Setup-Assistant/releases/tag/v0.2.2
+[0.2.1]: https://github.com/leee880619-commits/ClaudeCode-Harness-Setup-Assistant/releases/tag/v0.2.1
+[0.2.0]: https://github.com/leee880619-commits/ClaudeCode-Harness-Setup-Assistant/releases/tag/v0.2.0
+[0.1.0]: https://github.com/leee880619-commits/ClaudeCode-Harness-Setup-Assistant/releases/tag/v0.1.0
